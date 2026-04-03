@@ -1,0 +1,17 @@
+{
+    "name": "Agent Sandbox",
+    "dockerComposeFile": [],
+    "service": "agent",
+    "workspaceFolder": "/workspace",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-azuretools.vscode-docker"
+            ],
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "bash"
+            }
+        }
+    },
+    "remoteUser": "agent"
+}

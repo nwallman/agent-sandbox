@@ -8,9 +8,121 @@ Agent Sandbox gives each AI coding session its own Docker container, git worktre
 
 The system is provider-agnostic: a small plugin in `providers/` teaches the launcher how to start and connect to a specific agent (Claude Code, Codex, Gemini CLI, or your own). Everything else — networking, isolation, profiles, worktrees — is shared infrastructure.
 
+## Getting Started
+
+### Prerequisites
+
+1. **Docker Desktop** — [download here](https://www.docker.com/products/docker-desktop/). On Windows this requires WSL2 (the Docker installer will set it up). On Linux, Docker Engine works too.
+2. **Git 2.28+** — [download here](https://git-scm.com/downloads). On Windows, install "Git for Windows" which includes Git Bash.
+3. **An API key for your agent** — for Claude Code, get one at [console.anthropic.com](https://console.anthropic.com/).
+
+### Step 1: Clone and configure
+
+```bash
+git clone https://github.com/agent-sandbox/agent-sandbox
+cd agent-sandbox
+cp .sandbox.env.example .sandbox.env
+```
+
+Open `.sandbox.env` in your editor and set these values:
+
+```bash
+# Required — your Anthropic API key (or whichever provider you use)
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+
+# Required — the parent directory where your projects live.
+# All project directories must be immediate children of this path.
+# Example: if your project is at ~/projects/my-app, set this to ~/projects
+SANDBOX_BASE_DIR=/home/you/projects
+```
+
+> **How SANDBOX_BASE_DIR works:** When you run `sandbox.sh start my-app session1`, the launcher looks for your project at `$SANDBOX_BASE_DIR/my-app`. If you don't set this, it defaults to the parent directory of wherever you cloned agent-sandbox.
+
+**Windows users:** Use Git Bash paths in `.sandbox.env` (e.g., `/c/Dev` not `C:\Dev`).
+
+### Step 2: Start your first sandbox
+
+Pick a project you want to work on. It must be a git repository under `SANDBOX_BASE_DIR`:
+
+```bash
+# Linux / macOS / Git Bash
+./sandbox.sh start my-app feature-work
+
+# Windows PowerShell
+.\sandbox.ps1 start my-app feature-work
+```
+
+The first run will take a few minutes — it builds the Docker images (base OS, proxy, and your agent). Subsequent starts are fast because images are cached.
+
+What this does:
+1. Creates a git worktree at `$SANDBOX_WORKTREE_DIR/my-app--feature-work` on branch `feature-work`
+2. Builds a Docker image with your agent installed
+3. Starts the container with the worktree mounted at `/workspace`
+4. Installs project dependencies (npm/Gradle) automatically
+5. Prints connection info and port mappings
+
+### Step 3: Connect and use the agent
+
+```bash
+./sandbox.sh shell my-app feature-work
+```
+
+This drops you into a bash shell inside the container. From here, start your agent:
+
+```bash
+# For Claude Code (the default provider):
+claude                    # interactive mode
+claude --headless         # headless mode (connect via claude.ai)
+
+# If you started with --dangerous:
+claude --dangerously-skip-permissions
+```
+
+Or use the shortcut for headless mode directly:
+
+```bash
+./sandbox.sh headless my-app feature-work
+```
+
+**VS Code users:** You can also attach directly to the container — press `Ctrl+Shift+P` → "Dev Containers: Attach to Running Container" → select `sandbox-my-app-feature-work-agent`.
+
+### Step 4: Review and merge (or discard)
+
+When the agent is done working:
+
+```bash
+# See what changed
+./sandbox.sh diff my-app feature-work
+
+# Merge the session branch into your project's current branch
+./sandbox.sh merge my-app feature-work
+
+# Clean up containers, volumes, worktree, and branch
+./sandbox.sh stop my-app feature-work --clean
+```
+
+Or if you want to throw away the work:
+
+```bash
+./sandbox.sh stop my-app feature-work --clean
+```
+
+### Running multiple sessions
+
+Each session is fully isolated — you can run several in parallel on the same project or across different projects:
+
+```bash
+./sandbox.sh start my-app feature-a
+./sandbox.sh start my-app feature-b
+./sandbox.sh start other-project bugfix
+./sandbox.sh list    # see all running sandboxes
+```
+
+---
+
 ## Features
 
-- **Provider plugins** — swap or add agent backends via a four-function hook interface
+- **Provider plugins** — swap or add agent backends via a hook-based interface
 - **Worktree isolation** — every session gets its own git branch and working directory; no conflicts between parallel sessions
 - **Network filtering** — outbound HTTP/HTTPS routed through Squid proxy with a domain allowlist; containers cannot reach the internet directly
 - **Resource limits** — CPU, memory, and PID caps enforced at the container level
@@ -19,38 +131,13 @@ The system is provider-agnostic: a small plugin in `providers/` teaches the laun
 - **Cross-platform** — `sandbox.sh` for Linux/macOS/Git Bash; `sandbox.ps1` wrapper for Windows PowerShell
 - **Devcontainer support** — attach VS Code directly to any running sandbox container
 
-## Quick Start
-
-```bash
-# 1. Clone the repo
-git clone https://github.com/agent-sandbox/agent-sandbox
-cd agent-sandbox
-
-# 2. Copy and fill in the env file
-cp .sandbox.env.example .sandbox.env
-# Edit .sandbox.env — set ANTHROPIC_API_KEY and SANDBOX_BASE_DIR at minimum
-
-# 3. Start a sandbox for your project
-./sandbox.sh start myproject my-session
-
-# 4. Open a shell and run the agent
-./sandbox.sh shell myproject my-session
-```
-
-On Windows, use `sandbox.ps1` instead:
-
-```powershell
-.\sandbox.ps1 start myproject my-session
-.\sandbox.ps1 shell myproject my-session
-```
-
 ## Requirements
 
-- **Docker Desktop** (or Docker Engine on Linux)
-- **Git** 2.28+
-- **Bash** — Git Bash on Windows, system bash on Linux/macOS
+- **Docker Desktop** (or Docker Engine on Linux) — [download](https://www.docker.com/products/docker-desktop/)
+- **Git** 2.28+ — [download](https://git-scm.com/downloads)
+- **Bash** — Git Bash on Windows (included with Git for Windows), system bash on Linux/macOS
 - **PowerShell** 5.1+ (Windows only, for `sandbox.ps1`)
-- **WSL2** (Windows only) — required by Docker Desktop; no additional configuration needed
+- **WSL2** (Windows only) — required by Docker Desktop; the Docker installer handles this
 
 ## Configuration
 

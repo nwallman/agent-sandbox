@@ -1,0 +1,96 @@
+services:
+  agent:
+    image: agent-sandbox:${SANDBOX_PROFILE:-base}
+    container_name: ${COMPOSE_PROJECT_NAME}-agent
+    init: true
+    stdin_open: true
+    tty: true
+    volumes:
+      - ${SANDBOX_PROJECT_PATH}:/workspace:${SANDBOX_WORKSPACE_MODE:-rw}
+      - ${SANDBOX_PROJECT_GIT}:/project-git
+      - gradle-cache:/home/agent/.gradle
+      - ${SANDBOX_GRADLE_HOST:-/dev/null}:/home/agent/.gradle-host:ro
+      - build-output:/build-output
+    environment:
+      - HTTP_PROXY=${SANDBOX_HTTP_PROXY:-}
+      - HTTPS_PROXY=${SANDBOX_HTTPS_PROXY:-}
+      - NO_PROXY=${SANDBOX_NO_PROXY:-}
+      - http_proxy=${SANDBOX_HTTP_PROXY:-}
+      - https_proxy=${SANDBOX_HTTPS_PROXY:-}
+      - no_proxy=${SANDBOX_NO_PROXY:-}
+      - JAVA_TOOL_OPTIONS=${SANDBOX_JAVA_PROXY_OPTS:-}
+      - NODE_OPTIONS=--max-old-space-size=4096
+      - DOCKER_HOST=${SANDBOX_DOCKER_HOST:-}
+      - TESTCONTAINERS_HOST_OVERRIDE=${SANDBOX_TESTCONTAINERS_HOST:-}
+      - TESTCONTAINERS_RYUK_DISABLED=${SANDBOX_RYUK_DISABLED:-}
+      - HOST_PORT_FRONTEND=${SANDBOX_PORT_FRONTEND:-3000}
+      - HOST_PORT_API=${SANDBOX_PORT_API:-8080}
+      - HOST_PORT_DB=${SANDBOX_PORT_DB:-5432}
+      - HOST_PORT_PREVIEW=${SANDBOX_PORT_PREVIEW:-5173}
+      - HOST_PORT_STORYBOOK=${SANDBOX_PORT_STORYBOOK:-6006}
+    ports:
+      - "${SANDBOX_PORT_FRONTEND:-3000}:3000"
+      - "${SANDBOX_PORT_API:-8080}:8080"
+      - "${SANDBOX_PORT_PREVIEW:-0}:5173"
+      - "${SANDBOX_PORT_STORYBOOK:-0}:6006"
+    working_dir: /workspace
+    networks:
+      - sandbox-net
+    tmpfs:
+      - /tmp:size=1g,exec
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${SANDBOX_CPU_LIMIT:-8}"
+          memory: ${SANDBOX_MEMORY_LIMIT:-16g}
+          pids: ${SANDBOX_PID_LIMIT:-2048}
+
+  proxy:
+    image: agent-sandbox:proxy
+    container_name: ${COMPOSE_PROJECT_NAME}-proxy
+    volumes:
+      - ${SANDBOX_WHITELIST_FILE}:/etc/squid/allowed-domains.txt:ro
+      - ${SANDBOX_SQUID_CONF}:/etc/squid/squid.conf:ro
+    networks:
+      - sandbox-net
+      - sandbox-external
+    profiles:
+      - proxy
+
+  dind:
+    image: agent-sandbox:dind
+    container_name: ${COMPOSE_PROJECT_NAME}-dind
+    privileged: true
+    networks:
+      - sandbox-net
+    tmpfs:
+      - /var/lib/docker:size=${SANDBOX_DIND_STORAGE:-8g}
+    command: ["dockerd", "--host=unix:///var/run/docker.sock", "--host=tcp://0.0.0.0:2375", "--tls=false"]
+    environment:
+      - DOCKER_TLS_CERTDIR=
+      - HTTP_PROXY=${SANDBOX_HTTP_PROXY:-}
+      - HTTPS_PROXY=${SANDBOX_HTTPS_PROXY:-}
+      - NO_PROXY=${SANDBOX_NO_PROXY:-}
+      - http_proxy=${SANDBOX_HTTP_PROXY:-}
+      - https_proxy=${SANDBOX_HTTPS_PROXY:-}
+      - no_proxy=${SANDBOX_NO_PROXY:-}
+    deploy:
+      resources:
+        limits:
+          cpus: "${SANDBOX_CPU_LIMIT:-8}"
+          memory: ${SANDBOX_MEMORY_LIMIT:-16g}
+          pids: ${SANDBOX_PID_LIMIT:-2048}
+    profiles:
+      - docker
+
+volumes:
+  gradle-cache:
+  build-output:
+
+networks:
+  sandbox-net:
+    name: ${COMPOSE_PROJECT_NAME}-net
+    internal: ${SANDBOX_NET_INTERNAL:-true}
+  sandbox-external:
+    name: ${COMPOSE_PROJECT_NAME}-ext

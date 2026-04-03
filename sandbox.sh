@@ -339,8 +339,8 @@ cmd_start() {
         git -C "$project_path" worktree add "$worktree_path" "$branch"
     fi
 
-    # Store branch name for cleanup (outside worktree to avoid polluting git)
-    echo "$branch" > "${worktree_path}.sandbox-meta"
+    # Store branch name and provider for cleanup and reconnection
+    printf '%s\n%s\n' "$branch" "$provider" > "${worktree_path}.sandbox-meta"
 
     # Detect or use specified profile (from worktree)
     if [[ -z "$profile" ]]; then
@@ -557,24 +557,34 @@ NODEEOF
     local provider_override
     provider_override=$(mktemp)
     _tmpfiles+=("$provider_override")
-    cat > "$provider_override" << 'EOF'
-services:
-  agent:
-    environment:
-EOF
+
+    local env_lines=""
     if type provider_env &>/dev/null; then
-        while IFS= read -r env_line; do
-            [[ -n "$env_line" ]] && echo "      - ${env_line}" >> "$provider_override"
-        done < <(provider_env)
+        env_lines=$(provider_env | grep -v '^$' || true)
     fi
-    cat >> "$provider_override" << 'EOF'
-    volumes:
-EOF
+
+    local mount_lines=""
     if type provider_mounts &>/dev/null; then
-        while IFS= read -r mount_line; do
-            [[ -n "$mount_line" ]] && echo "      - ${mount_line}" >> "$provider_override"
-        done < <(provider_mounts)
+        mount_lines=$(provider_mounts | grep -v '^$' || true)
     fi
+
+    echo "services:" > "$provider_override"
+    echo "  agent:" >> "$provider_override"
+
+    if [[ -n "$env_lines" ]]; then
+        echo "    environment:" >> "$provider_override"
+        while IFS= read -r env_line; do
+            echo "      - ${env_line}" >> "$provider_override"
+        done <<< "$env_lines"
+    fi
+
+    if [[ -n "$mount_lines" ]]; then
+        echo "    volumes:" >> "$provider_override"
+        while IFS= read -r mount_line; do
+            echo "      - ${mount_line}" >> "$provider_override"
+        done <<< "$mount_lines"
+    fi
+
     compose_files+=("-f" "$provider_override")
 
     local compose_up_args=()
@@ -798,7 +808,7 @@ cmd_stop() {
             # Read the actual branch name (stored outside worktree to avoid polluting git)
             local branch_name="$session"
             if [[ -f "${worktree_path}.sandbox-meta" ]]; then
-                branch_name=$(cat "${worktree_path}.sandbox-meta")
+                branch_name=$(sed -n '1p' "${worktree_path}.sandbox-meta")
             fi
             # Enable long paths to handle deeply nested files (node_modules, Gradle caches)
             git -C "$project_path" config core.longpaths true
@@ -896,7 +906,16 @@ cmd_shell() {
     local project="$1"
     local session="$2"
     validate_session_name "$session"
-    load_provider "$SANDBOX_PROVIDER"
+
+    # Resolve provider from session metadata (persisted at start time)
+    local meta_file="${SANDBOX_WORKTREE_DIR}/${project}--${session}.sandbox-meta"
+    local resolved_provider="$SANDBOX_PROVIDER"
+    if [[ -f "$meta_file" ]]; then
+        local meta_provider
+        meta_provider=$(sed -n '2p' "$meta_file")
+        [[ -n "$meta_provider" ]] && resolved_provider="$meta_provider"
+    fi
+    load_provider "$resolved_provider"
 
     local comp_name
     comp_name=$(compose_project_name "$project" "$session")
@@ -909,7 +928,16 @@ cmd_headless() {
     local project="$1"
     local session="$2"
     validate_session_name "$session"
-    load_provider "$SANDBOX_PROVIDER"
+
+    # Resolve provider from session metadata (persisted at start time)
+    local meta_file="${SANDBOX_WORKTREE_DIR}/${project}--${session}.sandbox-meta"
+    local resolved_provider="$SANDBOX_PROVIDER"
+    if [[ -f "$meta_file" ]]; then
+        local meta_provider
+        meta_provider=$(sed -n '2p' "$meta_file")
+        [[ -n "$meta_provider" ]] && resolved_provider="$meta_provider"
+    fi
+    load_provider "$resolved_provider"
 
     local comp_name
     comp_name=$(compose_project_name "$project" "$session")
@@ -1011,7 +1039,7 @@ cmd_merge() {
     # Read the branch name
     local branch_name="$session"
     if [[ -f "${worktree_path}.sandbox-meta" ]]; then
-        branch_name=$(cat "${worktree_path}.sandbox-meta")
+        branch_name=$(sed -n '1p' "${worktree_path}.sandbox-meta")
     fi
 
     # Stop the sandbox if running (restores .git pointer)

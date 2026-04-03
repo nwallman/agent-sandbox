@@ -23,8 +23,8 @@ if [[ -f "$SCRIPT_DIR/.sandbox.env" ]]; then
     set +a
 fi
 
-# Defaults
-SANDBOX_BASE_DIR="${SANDBOX_BASE_DIR:-/c/Dev}"
+# Defaults — SANDBOX_BASE_DIR defaults to the parent of this repo
+SANDBOX_BASE_DIR="${SANDBOX_BASE_DIR:-$(dirname "$SCRIPT_DIR")}"
 SANDBOX_WORKTREE_DIR="${SANDBOX_WORKTREE_DIR:-$SANDBOX_BASE_DIR/.worktrees}"
 SANDBOX_LOG="$SCRIPT_DIR/sessions.log"
 
@@ -155,7 +155,7 @@ detect_profile() {
     local has_node=false
 
     [[ -f "$project_path/build.gradle" || -f "$project_path/build.gradle.kts" || -f "$project_path/pom.xml" ]] && has_java=true
-    # Check subdirectories too (e.g., ripple-reserve/api/build.gradle)
+    # Check subdirectories too (e.g., myproject/api/build.gradle)
     if [[ "$has_java" == "false" ]]; then
         for f in "$project_path"/*/build.gradle "$project_path"/*/build.gradle.kts "$project_path"/*/pom.xml; do
             [[ -f "$f" ]] && has_java=true && break

@@ -88,10 +88,10 @@ By default the latest Claude Code CLI release is installed. To pin a version, se
 AGENT_VERSION=1.2.3
 ```
 
-Or pass it at build time:
+The launcher passes this as a build arg when building the provider layer on top of the base image. You can also force a rebuild with a specific version:
 
 ```bash
-docker build --build-arg AGENT_VERSION=1.2.3 -f Dockerfile.claude .
+sandbox.sh update  # rebuilds all images with latest
 ```
 
 Valid values are any version tag published to the Claude Code install channel, or `latest` (default).

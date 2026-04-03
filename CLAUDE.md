@@ -8,7 +8,7 @@ Agent Sandbox is a provider-agnostic Docker sandbox for running AI coding agents
 |------|---------|
 | `sandbox.sh` | Main launcher (Bash). Commands: start, stop, list, logs, shell, headless, diff, repair |
 | `sandbox.ps1` | PowerShell wrapper — delegates to `sandbox.sh` via Git Bash |
-| `docker-compose.base.yml` | Claude container template, parameterized via env vars |
+| `docker-compose.base.yml` | Agent container template, parameterized via env vars |
 | `providers/` | Provider plugins — one subdirectory per agent type |
 | `images/` | Dockerfiles: `base/`, `proxy/`, `dind/`, `profiles/` |
 | `skills/` | Bundled Claude Code skills shipped into containers |
@@ -36,10 +36,13 @@ Each provider lives under `providers/<name>/` and implements:
 | `provider.conf` | Yes | Metadata: name, image, default profile, env vars |
 
 Hooks in `provider.sh`:
-- `provider_build_args` — echo extra `docker build` args
-- `provider_env_vars` — echo `KEY=VALUE` lines to inject into the container
-- `provider_start_pre` / `provider_start_post` — lifecycle hooks
-- `provider_container_cmd` — echo the command to run inside the container
+- `provider_setup` — echo Dockerfile lines to install the agent (build-time)
+- `provider_start` — post-launch initialization (args: container_name, dangerous)
+- `provider_connect` — attach interactive session (args: container_name)
+- `provider_healthcheck` — return 0 if healthy (args: container_name)
+- `provider_env` (optional) — echo KEY=VALUE lines for extra env vars
+- `provider_mounts` (optional) — echo volume mount strings (source:dest:mode)
+- `provider_headless` (optional) — start non-interactive mode (args: container_name)
 
 Core scripts must not hardcode any provider name. Always delegate to hooks.
 

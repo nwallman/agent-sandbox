@@ -15,7 +15,7 @@ Merge a completed sandbox session and clean up all resources.
 
 Use this priority order:
 
-1. **If the user provided arguments** (e.g., `/sandbox-merge ripple-reserve my-session`), parse them as `<project> <session>`.
+1. **If the user provided arguments** (e.g., `/sandbox-merge myproject my-session`), parse them as `<project> <session>`.
 
 2. **Detect project from cwd** — extract the project name from the current working directory path. The working directory follows the pattern `C:\Dev\<project>` or `/c/Dev/<project>`. Extract the `<project>` portion directly from the path without running any bash commands.
 

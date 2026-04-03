@@ -61,7 +61,7 @@ Copy `.sandbox.env.example` to `.sandbox.env` and set your values. This file is 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | — | API key for Claude Code (required by the claude-code provider) |
-| `SANDBOX_BASE_DIR` | `/c/Dev` | Parent directory where projects live |
+| `SANDBOX_BASE_DIR` | Parent of agent-sandbox dir | Parent directory where projects live |
 | `SANDBOX_WORKTREE_DIR` | `$SANDBOX_BASE_DIR/.worktrees` | Where git worktrees are created |
 | `SANDBOX_PROVIDER` | `claude-code` | Default provider plugin |
 | `SANDBOX_CPU_LIMIT` | `8` | CPU limit for containers |

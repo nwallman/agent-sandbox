@@ -38,7 +38,7 @@ provider_setup() {
   echo "# example provider: no additional setup required"
 }
 
-# provider_start <container_name>
+# provider_start <container_name> [dangerous]
 #
 # Called once after the container has started and is healthy, before handing
 # control to the user. Use this for agent-specific runtime initialization that
@@ -47,12 +47,15 @@ provider_setup() {
 #
 # Args:
 #   $1  container_name — the running Docker container name
+#   $2  dangerous (optional) — "true" if --dangerous flag was used, "false" otherwise
+#       Use this to configure the agent to skip permission prompts.
 #
 # A real implementation might run:
 #   docker exec "$container_name" sh -c "my-agent auth login --token $MY_AGENT_TOKEN"
 #
 provider_start() {
   local container_name="${1:?container_name required}"
+  local dangerous="${2:-false}"
   # Stub — nothing to initialize
   :
 }

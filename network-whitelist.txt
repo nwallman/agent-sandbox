@@ -1,0 +1,44 @@
+# Domain whitelist for sandbox proxy (Squid)
+# Format: .example.com = all subdomains, example.com = exact match only
+# WARNING: Do NOT list both .example.com and sub.example.com — Squid rejects redundancies
+
+# Anthropic API & services
+.claude.ai
+.claude.com
+.anthropic.com
+storage.googleapis.com
+
+# npm / Node.js
+.npmjs.org
+.yarnpkg.com
+deb.nodesource.com
+
+# Java / Gradle / Maven
+.maven.org
+repo.maven.apache.org
+.gradle.org
+packages.adoptium.net
+
+# Python
+.pypi.org
+files.pythonhosted.org
+
+# OS packages (apt)
+.debian.org
+.ubuntu.com
+
+# Code hosting & docs
+.github.com
+.githubusercontent.com
+.stackoverflow.com
+.stackexchange.com
+developer.mozilla.org
+docs.oracle.com
+
+# CDNs — only specific hosts, not broad wildcards
+cdn.jsdelivr.net
+
+# Docker Hub (for DinD Testcontainers image pulls)
+.docker.io
+.docker.com
+.cloudflarestorage.com

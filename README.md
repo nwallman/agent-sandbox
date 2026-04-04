@@ -395,11 +395,14 @@ cp -r skills/sandbox-execute ~/.claude/skills/
 cp -r skills/sandbox-merge ~/.claude/skills/
 ```
 
-Set `AGENT_SANDBOX_HOME` to your agent-sandbox directory so the skills can find `sandbox.ps1`:
+Set `AGENT_SANDBOX_HOME` as a persistent environment variable so the skills can find `sandbox.ps1`. Change the path to wherever you cloned agent-sandbox:
 
 ```powershell
-$env:AGENT_SANDBOX_HOME = "C:\Dev\agent-sandbox"
+# PowerShell — persists across sessions
+[System.Environment]::SetEnvironmentVariable("AGENT_SANDBOX_HOME", "C:\Dev\agent-sandbox", "User")
 ```
+
+> **Note:** Restart your terminal after setting this for it to take effect.
 
 See [skills/README.md](skills/README.md) for full details.
 

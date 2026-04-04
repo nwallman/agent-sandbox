@@ -655,6 +655,16 @@ GRADLE_EOF
             "echo 'testcontainers.reuse.enable=true' > /home/agent/.testcontainers.properties"
     fi
 
+    # Auto-install Playwright browsers if the project depends on Playwright (node/fullstack only)
+    if [[ "$profile" == "node" || "$profile" == "fullstack" ]]; then
+        docker exec "${comp_name}-agent" bash -c '
+            if grep -rq "@playwright" /workspace/packages/*/package.json /workspace/package.json 2>/dev/null; then
+                echo "  Installing Playwright browsers..."
+                npx playwright install --with-deps chromium 2>&1 | tail -1
+            fi
+        ' || true
+    fi
+
     # Fix CRLF line endings on shell scripts (Windows host -> Linux container)
     docker exec -u root "${comp_name}-agent" bash -c \
         "find /workspace -maxdepth 4 -type f \( -name '*.sh' -o -name 'gradlew' \) -exec dos2unix -q {} + 2>/dev/null" || true

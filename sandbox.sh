@@ -602,8 +602,10 @@ NODEEOF
     docker compose -p "$comp_name" "${compose_files[@]}" "${compose_up_args[@]}" up -d
 
     # Fix ownership on session-local volumes (created as root by Docker)
-    docker exec -u root "${comp_name}-agent" bash -c \
-        "chown agent:agent /home/agent/.gradle /build-output || true"
+    if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
+        docker exec -u root "${comp_name}-agent" bash -c \
+            "chown agent:agent /home/agent/.gradle /build-output || true"
+    fi
     # Fix ownership on node_modules volumes (created as root by Docker)
     docker exec -u root "${comp_name}-agent" bash -c \
         'for d in /workspace/node_modules /workspace/*/node_modules; do [ -d "$d" ] && chown agent:agent "$d"; done' 2>/dev/null || true
@@ -611,27 +613,28 @@ NODEEOF
     # Provider-specific post-start initialization
     provider_start "${comp_name}-agent" "$dangerous"
 
-    # Seed Gradle cache from host (first start only)
-    # Only copy dependency jars (modules-*) and wrapper — NOT transforms, groovy-dsl,
-    # or version-specific immutable workspaces, which contain platform-specific metadata
-    # that causes "immutable workspace does not contain metadata" errors on Linux.
-    docker exec "${comp_name}-agent" bash -c '
-        if [ -d /home/agent/.gradle-host/caches ] && [ ! -d /home/agent/.gradle/caches ]; then
-            echo "  Seeding Gradle cache from host..."
-            mkdir -p /home/agent/.gradle/caches
-            for d in /home/agent/.gradle-host/caches/modules-*; do
-                [ -d "$d" ] && cp -a "$d" /home/agent/.gradle/caches/ 2>/dev/null || true
-            done
-            cp -a /home/agent/.gradle-host/wrapper /home/agent/.gradle/wrapper 2>/dev/null || true
-            echo "  Gradle cache seeded."
-        fi
-    '
+    if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
+        # Seed Gradle cache from host (first start only)
+        # Only copy dependency jars (modules-*) and wrapper — NOT transforms, groovy-dsl,
+        # or version-specific immutable workspaces, which contain platform-specific metadata
+        # that causes "immutable workspace does not contain metadata" errors on Linux.
+        docker exec "${comp_name}-agent" bash -c '
+            if [ -d /home/agent/.gradle-host/caches ] && [ ! -d /home/agent/.gradle/caches ]; then
+                echo "  Seeding Gradle cache from host..."
+                mkdir -p /home/agent/.gradle/caches
+                for d in /home/agent/.gradle-host/caches/modules-*; do
+                    [ -d "$d" ] && cp -a "$d" /home/agent/.gradle/caches/ 2>/dev/null || true
+                done
+                cp -a /home/agent/.gradle-host/wrapper /home/agent/.gradle/wrapper 2>/dev/null || true
+                echo "  Gradle cache seeded."
+            fi
+        '
 
-    # Gradle performance tuning (persists across sessions via gradle-cache volume)
-    docker exec "${comp_name}-agent" bash -c '
-        props="$HOME/.gradle/gradle.properties"
-        if [ ! -f "$props" ]; then
-            cat > "$props" << "GRADLE_EOF"
+        # Gradle performance tuning (persists across sessions via gradle-cache volume)
+        docker exec "${comp_name}-agent" bash -c '
+            props="$HOME/.gradle/gradle.properties"
+            if [ ! -f "$props" ]; then
+                cat > "$props" << "GRADLE_EOF"
 # Sandbox Gradle performance tuning
 org.gradle.daemon=true
 org.gradle.daemon.idletimeout=1800000
@@ -642,8 +645,9 @@ org.gradle.configuration-cache=true
 org.gradle.configuration-cache.problems=warn
 org.gradle.workers.max=4
 GRADLE_EOF
-        fi
-    '
+            fi
+        '
+    fi
 
     # Enable Testcontainers reusable containers when Docker is enabled
     if [[ "$docker" == "true" ]]; then

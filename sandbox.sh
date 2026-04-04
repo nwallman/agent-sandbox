@@ -411,6 +411,9 @@ cmd_start() {
 
     # Build compose file list
     local compose_files=("-f" "$SCRIPT_DIR/docker-compose.base.yml")
+    if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
+        compose_files+=("-f" "$SCRIPT_DIR/docker-compose.java.yml")
+    fi
     if [[ -f "$worktree_path/docker-compose.sandbox.yml" ]]; then
         compose_files+=("-f" "$worktree_path/docker-compose.sandbox.yml")
     fi
@@ -420,11 +423,13 @@ cmd_start() {
     export SANDBOX_PROFILE="$profile"
     export SANDBOX_PROJECT_PATH="$worktree_path"
     export SANDBOX_PROJECT_GIT="$project_path/.git"
-    # Mount host Gradle cache if it exists (for seeding container cache)
-    if [[ -d "$HOME/.gradle/caches" ]]; then
-        export SANDBOX_GRADLE_HOST="$HOME/.gradle"
-    else
-        export SANDBOX_GRADLE_HOST="/dev/null"
+    # Mount host Gradle cache if it exists (Java/fullstack only)
+    if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
+        if [[ -d "$HOME/.gradle/caches" ]]; then
+            export SANDBOX_GRADLE_HOST="$HOME/.gradle"
+        else
+            export SANDBOX_GRADLE_HOST="/dev/null"
+        fi
     fi
     export SANDBOX_PORT_FRONTEND="$port_frontend"
     export SANDBOX_PORT_API="$port_api"

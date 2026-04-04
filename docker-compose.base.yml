@@ -8,9 +8,6 @@ services:
     volumes:
       - ${SANDBOX_PROJECT_PATH}:/workspace:${SANDBOX_WORKSPACE_MODE:-rw}
       - ${SANDBOX_PROJECT_GIT}:/project-git
-      - gradle-cache:/home/agent/.gradle
-      - ${SANDBOX_GRADLE_HOST:-/dev/null}:/home/agent/.gradle-host:ro
-      - build-output:/build-output
     environment:
       - HTTP_PROXY=${SANDBOX_HTTP_PROXY:-}
       - HTTPS_PROXY=${SANDBOX_HTTPS_PROXY:-}
@@ -18,7 +15,6 @@ services:
       - http_proxy=${SANDBOX_HTTP_PROXY:-}
       - https_proxy=${SANDBOX_HTTPS_PROXY:-}
       - no_proxy=${SANDBOX_NO_PROXY:-}
-      - JAVA_TOOL_OPTIONS=${SANDBOX_JAVA_PROXY_OPTS:-}
       - NODE_OPTIONS=--max-old-space-size=4096
       - DOCKER_HOST=${SANDBOX_DOCKER_HOST:-}
       - TESTCONTAINERS_HOST_OVERRIDE=${SANDBOX_TESTCONTAINERS_HOST:-}
@@ -83,10 +79,6 @@ services:
           pids: ${SANDBOX_PID_LIMIT:-2048}
     profiles:
       - docker
-
-volumes:
-  gradle-cache:
-  build-output:
 
 networks:
   sandbox-net:

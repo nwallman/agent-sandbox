@@ -1,0 +1,12 @@
+services:
+  agent:
+    volumes:
+      - gradle-cache:/home/agent/.gradle
+      - ${SANDBOX_GRADLE_HOST:-/dev/null}:/home/agent/.gradle-host:ro
+      - build-output:/build-output
+    environment:
+      - JAVA_TOOL_OPTIONS=${SANDBOX_JAVA_PROXY_OPTS:-}
+
+volumes:
+  gradle-cache:
+  build-output:

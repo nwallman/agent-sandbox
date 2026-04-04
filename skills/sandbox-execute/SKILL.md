@@ -44,10 +44,10 @@ cat > $env:TEMP/sandbox-start-agent.sh << 'BASHSCRIPT'
 prompt=$(cat /home/agent/sandbox-prompt.txt)
 exec claude --dangerously-skip-permissions "$prompt"
 BASHSCRIPT
-cat > $env:TEMP/sandbox-launch.ps1 << 'SCRIPT'
-& "$env:AGENT_SANDBOX_HOME/sandbox.ps1" start <project> <session> --provider claude-code --dangerous
-docker cp $env:TEMP/sandbox-prompt.txt sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
-docker cp $env:TEMP/sandbox-start-agent.sh sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
+cat > $env:TEMP/sandbox-launch.ps1 << SCRIPT
+& "$AGENT_SANDBOX_HOME/sandbox.ps1" start <project> <session> --provider claude-code --dangerous
+docker cp \$env:TEMP/sandbox-prompt.txt sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
+docker cp \$env:TEMP/sandbox-start-agent.sh sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
 docker exec -u root sandbox-<project>-<session>-agent chmod +x /home/agent/sandbox-start-agent.sh
 docker exec -it sandbox-<project>-<session>-agent /home/agent/sandbox-start-agent.sh
 SCRIPT
@@ -57,8 +57,8 @@ powershell.exe -Command "Start-Process powershell -ArgumentList '-NoExit', '-Fil
 **If the sandbox is already running** (check with `docker ps --filter "name=sandbox-<project>-<session>" -q`), use a simpler launcher that skips the start step — replace the `sandbox-launch.ps1` content above with:
 
 ```powershell
-docker cp $env:TEMP/sandbox-prompt.txt sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
-docker cp $env:TEMP/sandbox-start-agent.sh sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
+docker cp \$env:TEMP/sandbox-prompt.txt sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
+docker cp \$env:TEMP/sandbox-start-agent.sh sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
 docker exec -u root sandbox-<project>-<session>-agent chmod +x /home/agent/sandbox-start-agent.sh
 docker exec -it sandbox-<project>-<session>-agent /home/agent/sandbox-start-agent.sh
 ```

@@ -46,31 +46,33 @@ Derive the session name by stripping the date prefix (`YYYY-MM-DD-`) and `.md` e
 
 Then run **one single Bash command** that creates all temp files and launches the PowerShell window. Replace `<project>`, `<session>`, and `<plan-file>` with actual values:
 
+**Important:** All temp files are namespaced with `<project>-<session>` to avoid collisions when launching multiple sandboxes concurrently.
+
 ```bash
 WINTMP="$HOME/AppData/Local/Temp"
-cat > "$WINTMP/sandbox-prompt.txt" << 'PROMPT'
+cat > "$WINTMP/sandbox-prompt-<project>-<session>.txt" << 'PROMPT'
 You are working in sandbox session <session> for project <project>. Execute the implementation plan at docs/superpowers/plans/<plan-file> using the superpowers:subagent-driven-development skill. Work through each task, commit after each one. When all tasks are complete, run the full test suite to verify, commit any remaining changes, and tell the user the work is ready for merge.
 PROMPT
-cat > "$WINTMP/sandbox-start-agent.sh" << 'BASHSCRIPT'
+cat > "$WINTMP/sandbox-start-agent-<project>-<session>.sh" << 'BASHSCRIPT'
 #!/bin/bash
 prompt=$(cat /home/agent/sandbox-prompt.txt)
 exec claude --dangerously-skip-permissions "$prompt"
 BASHSCRIPT
-cat > "$WINTMP/sandbox-launch.ps1" << 'SCRIPT'
+cat > "$WINTMP/sandbox-launch-<project>-<session>.ps1" << 'SCRIPT'
 & "$env:AGENT_SANDBOX_HOME/sandbox.ps1" start <project> <session> --provider claude-code --dangerous
-docker cp $env:TEMP/sandbox-prompt.txt sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
-docker cp $env:TEMP/sandbox-start-agent.sh sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
+docker cp "$env:TEMP/sandbox-prompt-<project>-<session>.txt" sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
+docker cp "$env:TEMP/sandbox-start-agent-<project>-<session>.sh" sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
 docker exec -u root sandbox-<project>-<session>-agent chmod +x /home/agent/sandbox-start-agent.sh
 docker exec -it sandbox-<project>-<session>-agent /home/agent/sandbox-start-agent.sh
 SCRIPT
-powershell.exe -Command 'Start-Process powershell -ArgumentList "-NoExit", "-File", "$env:TEMP\sandbox-launch.ps1"'
+powershell.exe -Command 'Start-Process powershell -ArgumentList "-NoExit", "-File", "$env:TEMP\sandbox-launch-<project>-<session>.ps1"'
 ```
 
-**If the sandbox is already running** (check with `docker ps --filter "name=sandbox-<project>-<session>" -q`), use a simpler launcher that skips the start step — replace the `sandbox-launch.ps1` content above with:
+**If the sandbox is already running** (check with `docker ps --filter "name=sandbox-<project>-<session>" -q`), use a simpler launcher that skips the start step — replace the `sandbox-launch-<project>-<session>.ps1` content above with:
 
 ```powershell
-docker cp \$env:TEMP/sandbox-prompt.txt sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
-docker cp \$env:TEMP/sandbox-start-agent.sh sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
+docker cp "$env:TEMP/sandbox-prompt-<project>-<session>.txt" sandbox-<project>-<session>-agent:/home/agent/sandbox-prompt.txt
+docker cp "$env:TEMP/sandbox-start-agent-<project>-<session>.sh" sandbox-<project>-<session>-agent:/home/agent/sandbox-start-agent.sh
 docker exec -u root sandbox-<project>-<session>-agent chmod +x /home/agent/sandbox-start-agent.sh
 docker exec -it sandbox-<project>-<session>-agent /home/agent/sandbox-start-agent.sh
 ```

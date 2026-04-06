@@ -105,11 +105,16 @@ Commands:
   diff <project> <session> [--stat]
       Show all uncommitted changes in the sandbox worktree
 
-  merge <project> <session>
+  merge <project> <session> [--clean]
       Stop sandbox, merge session branch into project's current branch
+      --clean: remove volumes, worktree, and branch after successful merge
 
   repair <project> <session>
       Fix .git pointer if container died without clean shutdown
+
+  prune [--force]
+      Remove orphaned sandbox volumes from stopped sessions
+      --force: skip confirmation prompt
 
   update
       Rebuild all sandbox images with latest agent CLI
@@ -227,11 +232,129 @@ validate_env_pair() {
     fi
 }
 
+# --- Gradle sparse cache ---
+
+# Build a minimal Gradle cache containing only dependencies needed by the project.
+# Parses lockfiles or runs `gradlew dependencies` to discover GAV coordinates, then
+# copies only matching jars from the host cache.
+# Args: $1 = project workspace path, $2 = output directory
+# Returns: 0 on success (output_dir populated), 1 on skip/failure
+build_sparse_gradle_cache() {
+    local project_path="$1"
+    local output_dir="$2"
+    local host_cache="$HOME/.gradle"
+    local files_dir=""
+
+    # Find the host cache files directory
+    for d in "$host_cache"/caches/modules-*/files-*; do
+        [[ -d "$d" ]] && files_dir="$d" && break
+    done
+    [[ -z "$files_dir" ]] && return 1
+
+    local modules_parent
+    modules_parent=$(dirname "$files_dir")
+    local modules_name
+    modules_name=$(basename "$modules_parent")
+    local files_name
+    files_name=$(basename "$files_dir")
+
+    # Find gradlew in the project
+    local gradlew=""
+    for gw in "$project_path/gradlew" "$project_path"/*/gradlew; do
+        [[ -f "$gw" ]] && gradlew="$gw" && break
+    done
+    [[ -z "$gradlew" ]] && return 1
+    local project_dir
+    project_dir=$(dirname "$gradlew")
+
+    # Collect GAV coordinates from the project
+    local gavs=""
+
+    # Strategy 1: Parse gradle.lockfile (instant, includes transitives)
+    for lockfile in "$project_dir"/gradle.lockfile "$project_dir"/*/gradle.lockfile; do
+        [[ -f "$lockfile" ]] || continue
+        # Format: group:artifact:version=configuration(s)
+        local parsed
+        parsed=$(grep -E '^[a-zA-Z]' "$lockfile" 2>/dev/null | sed 's/=.*//' | sort -u)
+        [[ -n "$parsed" ]] && gavs="$parsed"
+    done
+
+    # Strategy 2: Parse buildscript-locks (Gradle dependency locking via lockfile-per-config)
+    if [[ -z "$gavs" ]]; then
+        for lockdir in "$project_dir"/gradle/dependency-locks "$project_dir"/*/gradle/dependency-locks; do
+            [[ -d "$lockdir" ]] || continue
+            local parsed
+            parsed=$(grep -E '^[a-zA-Z]' "$lockdir"/*.lockfile 2>/dev/null | sed 's/.*://' | sed 's/=.*//' | sort -u)
+            [[ -n "$parsed" ]] && gavs="$parsed"
+        done
+    fi
+
+    # Strategy 3: Run gradlew dependencies (slow but complete, ~10-20s)
+    if [[ -z "$gavs" ]]; then
+        echo "  Resolving Gradle dependency tree (one-time)..."
+        local deps_output
+        if deps_output=$(cd "$project_dir" && ./gradlew dependencies -q 2>/dev/null); then
+            gavs=$(echo "$deps_output" | grep -oE '[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+' | sort -u)
+        fi
+    fi
+
+    [[ -z "$gavs" ]] && return 1
+
+    # Create output structure
+    local target_files="$output_dir/caches/$modules_name/$files_name"
+    mkdir -p "$target_files"
+
+    # Copy metadata entirely (small, ~6MB, needed for Gradle resolution)
+    for meta_dir in "$modules_parent"/metadata-*; do
+        [[ -d "$meta_dir" ]] && cp -a "$meta_dir" "$output_dir/caches/$modules_name/" 2>/dev/null || true
+    done
+    # Copy resources cache (small, needed for POM resolution)
+    for res_dir in "$modules_parent"/resources-*; do
+        [[ -d "$res_dir" ]] && cp -a "$res_dir" "$output_dir/caches/$modules_name/" 2>/dev/null || true
+    done
+
+    # Copy only matching artifacts from files cache
+    local copied=0
+    while IFS= read -r gav; do
+        [[ -z "$gav" ]] && continue
+        local group artifact version
+        group=$(echo "$gav" | cut -d: -f1)
+        artifact=$(echo "$gav" | cut -d: -f2)
+        version=$(echo "$gav" | cut -d: -f3)
+
+        local src="$files_dir/$group/$artifact/$version"
+        if [[ -d "$src" ]]; then
+            mkdir -p "$target_files/$group/$artifact"
+            cp -a "$src" "$target_files/$group/$artifact/" 2>/dev/null || true
+            ((copied++)) || true
+        fi
+    done <<< "$gavs"
+
+    # Copy matching Gradle wrapper distribution
+    local wrapper_props="$project_dir/gradle/wrapper/gradle-wrapper.properties"
+    if [[ -f "$wrapper_props" && -d "$host_cache/wrapper/dists" ]]; then
+        local dist_url
+        dist_url=$(grep 'distributionUrl' "$wrapper_props" | sed 's/.*=//' | sed 's/\\//g')
+        local dist_name
+        dist_name=$(basename "$dist_url" .zip)
+        mkdir -p "$output_dir/wrapper/dists"
+        for d in "$host_cache/wrapper/dists/$dist_name"*; do
+            [[ -d "$d" ]] && cp -a "$d" "$output_dir/wrapper/dists/" 2>/dev/null || true
+        done
+    fi
+
+    local total
+    total=$(echo "$gavs" | wc -l | tr -d ' ')
+    echo "  Sparse Gradle cache: $copied/$total dependencies copied from host"
+    return 0
+}
+
 # --- Commands ---
 
 cmd_start() {
     local _tmpfiles=()
-    cleanup_tmpfiles() { rm -f "${_tmpfiles[@]}"; }
+    local _tmpdirs=()
+    cleanup_tmpfiles() { rm -f "${_tmpfiles[@]}"; rm -rf "${_tmpdirs[@]}"; }
     trap cleanup_tmpfiles EXIT
 
     local project=""
@@ -424,9 +547,19 @@ cmd_start() {
     export SANDBOX_PROJECT_PATH="$worktree_path"
     export SANDBOX_PROJECT_GIT="$project_path/.git"
     # Mount host Gradle cache if it exists (Java/fullstack only)
+    # Uses a sparse cache containing only the project's dependencies instead of
+    # the entire ~/.gradle directory (saves GBs of unrelated artifacts).
     if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
         if [[ -d "$HOME/.gradle/caches" ]]; then
-            export SANDBOX_GRADLE_HOST="$HOME/.gradle"
+            local sparse_cache_dir
+            sparse_cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/sandbox-gradle-XXXXXX")
+            _tmpdirs+=("$sparse_cache_dir")
+            if build_sparse_gradle_cache "$project_path" "$sparse_cache_dir"; then
+                export SANDBOX_GRADLE_HOST="$sparse_cache_dir"
+            else
+                echo "  Warning: sparse cache failed, falling back to full ~/.gradle"
+                export SANDBOX_GRADLE_HOST="$HOME/.gradle"
+            fi
         else
             export SANDBOX_GRADLE_HOST="/dev/null"
         fi
@@ -863,6 +996,10 @@ cmd_list() {
     echo ""
 
     local found=false
+    local -a projects=()
+    local -a sessions=()
+    local idx=0
+
     for container in $(docker ps --filter "label=com.docker.compose.project" --format '{{.Labels}}' 2>/dev/null | grep -o 'com.docker.compose.project=[^ ,]*' | sed 's/com.docker.compose.project=//' | sort -u); do
         if [[ "$container" == sandbox-* ]]; then
             found=true
@@ -885,12 +1022,13 @@ cmd_list() {
             done
 
             if [[ -n "$project" && -n "$session" ]]; then
+                idx=$((idx + 1))
+                projects+=("$project")
+                sessions+=("$session")
                 local uptime
                 uptime=$(docker ps --filter "name=${container}-agent" --format '{{.Status}}' 2>/dev/null | head -1)
-                echo "  Project: $project"
-                echo "  Session: $session"
-                echo "  Status:  $uptime"
-                echo "  Shell:   sandbox shell $project $session"
+                echo "  [$idx] $project / $session"
+                echo "      Status: $uptime"
                 echo ""
             else
                 echo "  $container"
@@ -902,7 +1040,62 @@ cmd_list() {
 
     if [[ "$found" == "false" ]]; then
         echo "  (none)"
+        return
     fi
+
+    # Interactive menu — read from /dev/tty so it works whether invoked
+    # directly in bash, through the PowerShell wrapper, or via pipes.
+    # /dev/tty is available on Linux and Git Bash on Windows.
+    if [[ -t 0 ]]; then
+        local tty_in=/dev/stdin
+    elif [[ -e /dev/tty ]]; then
+        local tty_in=/dev/tty
+    else
+        return
+    fi
+
+    echo "Actions: [s]hell  [l]ogs  [d]iff  [m]erge  [x]stop  [q]uit"
+    echo ""
+
+    local pick
+    read -rp "Pick sandbox number: " pick < "$tty_in"
+    [[ -z "$pick" || "$pick" == "q" ]] && return
+
+    if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > idx )); then
+        echo "Invalid selection." >&2
+        return
+    fi
+
+    local sel_project="${projects[$((pick - 1))]}"
+    local sel_session="${sessions[$((pick - 1))]}"
+
+    local action
+    read -rp "Action for $sel_project/$sel_session [s/l/d/m/x/q]: " action < "$tty_in"
+    case "$action" in
+        s) cmd_shell "$sel_project" "$sel_session" ;;
+        l) cmd_logs "$sel_project" "$sel_session" ;;
+        d) cmd_diff "$sel_project" "$sel_session" ;;
+        m)
+            local do_clean
+            read -rp "Clean up after merge? [y/N]: " do_clean < "$tty_in"
+            if [[ "$do_clean" == [yY] ]]; then
+                cmd_merge "$sel_project" "$sel_session" --clean
+            else
+                cmd_merge "$sel_project" "$sel_session"
+            fi
+            ;;
+        x)
+            local do_clean
+            read -rp "Remove volumes and worktree (--clean)? [y/N]: " do_clean < "$tty_in"
+            if [[ "$do_clean" == [yY] ]]; then
+                cmd_stop "$sel_project" "$sel_session" --clean
+            else
+                cmd_stop "$sel_project" "$sel_session"
+            fi
+            ;;
+        q|"") return ;;
+        *) echo "Unknown action: $action" >&2 ;;
+    esac
 }
 
 cmd_logs() {
@@ -1042,8 +1235,17 @@ cmd_repair() {
 cmd_merge() {
     local project="$1"
     local session="$2"
+    shift 2
 
     validate_session_name "$session"
+
+    local clean=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --clean) clean=true ;;
+        esac
+        shift
+    done
 
     local worktree_path="$SANDBOX_WORKTREE_DIR/${project}--${session}"
     local project_path="$SANDBOX_BASE_DIR/$project"
@@ -1093,14 +1295,111 @@ cmd_merge() {
     if git -C "$project_path" merge "$branch_name" --no-edit; then
         echo ""
         echo "Merge complete. Branch '$branch_name' merged into '$current_branch'."
-        echo ""
-        echo "Next steps:"
-        echo "  sandbox stop $project $session --clean   # Remove worktree and branch"
-        echo "  git -C $project_path push                # Push to remote"
+
+        if [[ "$clean" == "true" ]]; then
+            echo ""
+            echo "Cleaning up sandbox..."
+            cmd_stop "$project" "$session" --clean
+        else
+            echo ""
+            echo "Next steps:"
+            echo "  sandbox stop $project $session --clean   # Remove worktree, volumes, and branch"
+            echo "  git -C $project_path push                # Push to remote"
+        fi
     else
         echo ""
         echo "Merge failed (conflicts?). Resolve in: $project_path"
     fi
+}
+
+cmd_prune() {
+    local force=false
+    if [[ "${1:-}" == "--force" ]]; then
+        force=true
+    fi
+
+    # Collect all sandbox-* volumes
+    local all_volumes
+    all_volumes=$(docker volume ls --format '{{.Name}}' | grep '^sandbox-' || true)
+
+    if [[ -z "$all_volumes" ]]; then
+        echo "No sandbox volumes found."
+        return
+    fi
+
+    # Collect volumes that belong to currently running compose projects
+    local active_volumes=""
+    for container in $(docker ps --filter "label=com.docker.compose.project" --format '{{.Labels}}' 2>/dev/null \
+        | grep -o 'com.docker.compose.project=[^ ,]*' | sed 's/com.docker.compose.project=//' | sort -u); do
+        if [[ "$container" == sandbox-* ]]; then
+            # List volumes owned by this running project
+            local project_vols
+            project_vols=$(docker compose -p "$container" config --volumes 2>/dev/null \
+                | sed "s/^/${container}_/" || true)
+            active_volumes="$active_volumes"$'\n'"$project_vols"
+        fi
+    done
+
+    # Filter to orphaned volumes (not owned by any running project)
+    local orphaned=""
+    local orphan_count=0
+    while IFS= read -r vol; do
+        [[ -z "$vol" ]] && continue
+        if ! echo "$active_volumes" | grep -qxF "$vol"; then
+            orphaned="$orphaned"$'\n'"$vol"
+            orphan_count=$((orphan_count + 1))
+        fi
+    done <<< "$all_volumes"
+
+    if [[ $orphan_count -eq 0 ]]; then
+        echo "No orphaned sandbox volumes found."
+        return
+    fi
+
+    # Group by session for readable output
+    echo "Orphaned sandbox volumes ($orphan_count):"
+    echo ""
+    local current_session=""
+    while IFS= read -r vol; do
+        [[ -z "$vol" ]] && continue
+        # Extract session prefix (everything before the last _suffix)
+        local session_prefix="${vol%_*}"
+        if [[ "$session_prefix" != "$current_session" ]]; then
+            current_session="$session_prefix"
+            echo "  $session_prefix"
+        fi
+        echo "    - ${vol##*_}"
+    done <<< "$orphaned"
+    echo ""
+
+    if [[ "$force" != "true" ]]; then
+        # Read from /dev/tty for cross-platform interactive prompt support
+        local tty_in=/dev/stdin
+        [[ -t 0 ]] || { [[ -e /dev/tty ]] && tty_in=/dev/tty; }
+        local confirm
+        read -rp "Remove all $orphan_count orphaned volumes? [y/N] " confirm < "$tty_in"
+        if [[ "$confirm" != [yY] ]]; then
+            echo "Aborted."
+            return
+        fi
+    fi
+
+    local removed=0
+    local failed=0
+    while IFS= read -r vol; do
+        [[ -z "$vol" ]] && continue
+        if docker volume rm "$vol" &>/dev/null; then
+            removed=$((removed + 1))
+        else
+            echo "  WARNING: Could not remove $vol (in use?)" >&2
+            failed=$((failed + 1))
+        fi
+    done <<< "$orphaned"
+
+    echo "Removed $removed volumes."
+    [[ $failed -gt 0 ]] && echo "$failed volumes could not be removed."
+
+    log_event "PRUNE" "removed=$removed failed=$failed"
 }
 
 cmd_update() {
@@ -1167,6 +1466,7 @@ case "$command" in
     diff)     cmd_diff "$@" ;;
     merge)    cmd_merge "$@" ;;
     repair)   cmd_repair "$@" ;;
+    prune)    cmd_prune "$@" ;;
     update)   cmd_update ;;
     -h|--help|help) usage ;;
     *)

@@ -29,7 +29,18 @@ Use this priority order:
 
 4. **If ambiguous** (multiple files, none clearly recent, none from conversation context), list them and ask the user to choose.
 
-### 3. Derive Session Name and Launch
+### 3. Verify Plan Is Committed
+
+The sandbox creates a git worktree from the current branch. If the plan file isn't committed, it won't exist in the worktree and the agent will start confused.
+
+Run `git status -- docs/superpowers/plans/<plan-file>` using the Bash tool. If the plan file shows as untracked or has uncommitted changes:
+
+1. **Auto-commit the plan** — stage and commit it with message `docs: add implementation plan <plan-file>`.
+2. Confirm to the user: "Committed the plan file so the sandbox worktree will include it."
+
+If `git status` shows the file is clean (committed and unmodified), proceed.
+
+### 4. Derive Session Name and Launch
 
 Derive the session name by stripping the date prefix (`YYYY-MM-DD-`) and `.md` extension from the plan filename. For example: `2026-04-01-feature-name.md` becomes `feature-name`.
 
@@ -64,7 +75,7 @@ docker exec -u root sandbox-<project>-<session>-agent chmod +x /home/agent/sandb
 docker exec -it sandbox-<project>-<session>-agent /home/agent/sandbox-start-agent.sh
 ```
 
-### 4. Report to User
+### 5. Report to User
 
 Print immediately after launching the window (don't wait for the sandbox to finish starting):
 

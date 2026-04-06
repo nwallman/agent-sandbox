@@ -16,7 +16,5 @@ USER agent
 WORKDIR /workspace
 RUN git config --global --add safe.directory /workspace \
     && git config --global core.autocrlf input \
-    && git config --global core.filemode false \
-    && git config --global user.name "Agent Sandbox" \
-    && git config --global user.email "sandbox@localhost"
+    && git config --global core.filemode false
 ENTRYPOINT ["/bin/bash"]

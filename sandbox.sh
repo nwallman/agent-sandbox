@@ -546,6 +546,9 @@ cmd_start() {
     export SANDBOX_PROFILE="$profile"
     export SANDBOX_PROJECT_PATH="$worktree_path"
     export SANDBOX_PROJECT_GIT="$project_path/.git"
+    # Pass host git identity into containers (honours user's global git config)
+    export SANDBOX_GIT_USER_NAME="${SANDBOX_GIT_USER_NAME:-$(git config --global user.name 2>/dev/null || echo 'Agent Sandbox')}"
+    export SANDBOX_GIT_USER_EMAIL="${SANDBOX_GIT_USER_EMAIL:-$(git config --global user.email 2>/dev/null || echo 'sandbox@localhost')}"
     # Mount host Gradle cache if it exists (Java/fullstack only)
     # Uses a sparse cache containing only the project's dependencies instead of
     # the entire ~/.gradle directory (saves GBs of unrelated artifacts).

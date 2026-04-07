@@ -22,7 +22,7 @@ Agent Sandbox is a provider-agnostic Docker sandbox for running AI coding agents
 - Container names: `sandbox-<project>-<session>-agent`
 - Network names: `sandbox-<project>-<session>-net`
 - Volume names: `sandbox-<project>-<session>_<volume>`
-- Worktree dirs: `$SANDBOX_WORKTREE_DIR/<project>--<session>`
+- Worktree dirs: `$SANDBOX_BASE_DIR/<project>/.worktrees/<project>--<session>`
 - Env var prefix: `SANDBOX_`
 
 ## Provider System

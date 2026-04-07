@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker volume:*)",
+      "Read(//c/Users/natew/.claude/skills/sandbox-execute/**)",
+      "Read(//c/Users/natew/.claude/skills/sandbox-execute/sandbox-execute/**)",
+      "Edit(~/.claude/skills/sandbox-execute/**)"
+    ]
+  }
+}

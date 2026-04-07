@@ -55,7 +55,7 @@ Pick a project you want to work on. It must be a git repository under `SANDBOX_B
 The first run will take a few minutes — it builds the Docker images (base OS, proxy, and your agent). Subsequent starts are fast because images are cached.
 
 What this does:
-1. Creates a git worktree at `$SANDBOX_WORKTREE_DIR/my-app--feature-work` on branch `feature-work`
+1. Creates a git worktree at `my-app/.worktrees/my-app--feature-work` on branch `feature-work`
 2. Builds a Docker image with your agent installed
 3. Starts the container with the worktree mounted at `/workspace`
 4. Installs project dependencies (npm/Gradle) automatically
@@ -149,7 +149,7 @@ Copy `.sandbox.env.example` to `.sandbox.env` and set your values. This file is 
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | — | API key for Claude Code (required by the claude-code provider) |
 | `SANDBOX_BASE_DIR` | Parent of agent-sandbox dir | Parent directory where projects live |
-| `SANDBOX_WORKTREE_DIR` | `$SANDBOX_BASE_DIR/.worktrees` | Where git worktrees are created |
+| — | `<project>/.worktrees/` | Worktrees are created per-project (not configurable) |
 | `SANDBOX_PROVIDER` | `claude-code` | Default provider plugin |
 | `SANDBOX_CPU_LIMIT` | `8` | CPU limit for containers |
 | `SANDBOX_MEMORY_LIMIT` | `16g` | Memory limit for containers |
@@ -175,7 +175,7 @@ Supported keys: `docker`, `profile`, `dangerous`, `open-network`, `cpu-limit`, `
 sandbox.sh start <project> <session> [options]
 ```
 
-Creates a git worktree at `$SANDBOX_WORKTREE_DIR/<project>--<session>`, builds the Docker image if needed, and starts the sandbox containers.
+Creates a git worktree at `<project>/.worktrees/<project>--<session>`, builds the Docker image if needed, and starts the sandbox containers.
 
 | Option | Description |
 |--------|-------------|

@@ -25,8 +25,13 @@ fi
 
 # Defaults — SANDBOX_BASE_DIR defaults to the parent of this repo
 SANDBOX_BASE_DIR="${SANDBOX_BASE_DIR:-$(dirname "$SCRIPT_DIR")}"
-SANDBOX_WORKTREE_DIR="${SANDBOX_WORKTREE_DIR:-$SANDBOX_BASE_DIR/.worktrees}"
 SANDBOX_LOG="$SCRIPT_DIR/sessions.log"
+
+# Worktree directory: per-project (.worktrees inside each project)
+# Usage: worktree_dir <project>
+worktree_dir() {
+    echo "$SANDBOX_BASE_DIR/$1/.worktrees"
+}
 
 # Provider (can be overridden by --provider flag, .sandbox.conf, or env)
 SANDBOX_PROVIDER="${SANDBOX_PROVIDER:-claude-code}"
@@ -446,8 +451,14 @@ cmd_start() {
     load_provider "$provider"
 
     # Create or reuse git worktree for session isolation
-    mkdir -p "$SANDBOX_WORKTREE_DIR"
-    local worktree_path="$SANDBOX_WORKTREE_DIR/${project}--${session}"
+    local wt_dir
+    wt_dir="$(worktree_dir "$project")"
+    mkdir -p "$wt_dir"
+    # Ensure .worktrees is gitignored in the project
+    if ! grep -qxF '/.worktrees' "$project_path/.gitignore" 2>/dev/null; then
+        echo '/.worktrees' >> "$project_path/.gitignore"
+    fi
+    local worktree_path="$wt_dir/${project}--${session}"
     if [[ -d "$worktree_path" ]]; then
         if [[ "$branch" != "$session" ]]; then
             echo "WARNING: --branch ignored; worktree already exists at $worktree_path"
@@ -941,7 +952,7 @@ cmd_stop() {
 
     # Restore host .git pointer (cmd_start overwrites it with container-internal paths)
     # This must happen before stop so host-side git works on the worktree afterward.
-    local worktree_path="$SANDBOX_WORKTREE_DIR/${project}--${session}"
+    local worktree_path="$(worktree_dir "$project")/${project}--${session}"
     local project_path="$SANDBOX_BASE_DIR/$project"
     if [[ -d "$worktree_path" ]]; then
         local worktree_name="${project}--${session}"
@@ -1011,7 +1022,7 @@ cmd_list() {
             # Find the session by looking for worktree meta files
             local project=""
             local session=""
-            for meta in "$SANDBOX_WORKTREE_DIR"/*--*.sandbox-meta; do
+            for meta in "$SANDBOX_BASE_DIR"/*/.worktrees/*--*.sandbox-meta; do
                 [ -f "$meta" ] || continue
                 local wt_name
                 wt_name=$(basename "${meta%.sandbox-meta}")
@@ -1123,7 +1134,7 @@ cmd_shell() {
     validate_session_name "$session"
 
     # Resolve provider from session metadata (persisted at start time)
-    local meta_file="${SANDBOX_WORKTREE_DIR}/${project}--${session}.sandbox-meta"
+    local meta_file="$(worktree_dir "$project")/${project}--${session}.sandbox-meta"
     local resolved_provider="$SANDBOX_PROVIDER"
     if [[ -f "$meta_file" ]]; then
         local meta_provider
@@ -1145,7 +1156,7 @@ cmd_headless() {
     validate_session_name "$session"
 
     # Resolve provider from session metadata (persisted at start time)
-    local meta_file="${SANDBOX_WORKTREE_DIR}/${project}--${session}.sandbox-meta"
+    local meta_file="$(worktree_dir "$project")/${project}--${session}.sandbox-meta"
     local resolved_provider="$SANDBOX_PROVIDER"
     if [[ -f "$meta_file" ]]; then
         local meta_provider
@@ -1183,7 +1194,7 @@ cmd_diff() {
     if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
         git_cmd=(docker exec "${comp_name}-agent" git)
     else
-        local worktree_path="$SANDBOX_WORKTREE_DIR/${project}--${session}"
+        local worktree_path="$(worktree_dir "$project")/${project}--${session}"
         if [[ ! -d "$worktree_path" ]]; then
             echo "ERROR: No worktree found at $worktree_path" >&2
             exit 1
@@ -1218,7 +1229,7 @@ cmd_repair() {
 
     validate_session_name "$session"
 
-    local worktree_path="$SANDBOX_WORKTREE_DIR/${project}--${session}"
+    local worktree_path="$(worktree_dir "$project")/${project}--${session}"
     local project_path="$SANDBOX_BASE_DIR/$project"
 
     if [[ ! -d "$worktree_path" ]]; then
@@ -1250,7 +1261,7 @@ cmd_merge() {
         shift
     done
 
-    local worktree_path="$SANDBOX_WORKTREE_DIR/${project}--${session}"
+    local worktree_path="$(worktree_dir "$project")/${project}--${session}"
     local project_path="$SANDBOX_BASE_DIR/$project"
     local comp_name
     comp_name=$(compose_project_name "$project" "$session")

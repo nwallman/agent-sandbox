@@ -33,6 +33,25 @@ worktree_dir() {
     echo "$SANDBOX_BASE_DIR/$1/.worktrees"
 }
 
+# Resolve existing worktree path, checking current and legacy locations
+# Usage: resolve_worktree <project> <session>
+resolve_worktree() {
+    local project="$1" session="$2"
+    local new_path="$(worktree_dir "$project")/${project}--${session}"
+    if [[ -d "$new_path" || -f "${new_path}.sandbox-meta" ]]; then
+        echo "$new_path"
+        return
+    fi
+    # Legacy: global .worktrees directory
+    local legacy_path="$SANDBOX_BASE_DIR/.worktrees/${project}--${session}"
+    if [[ -d "$legacy_path" || -f "${legacy_path}.sandbox-meta" ]]; then
+        echo "$legacy_path"
+        return
+    fi
+    # Default to new path (caller handles missing)
+    echo "$new_path"
+}
+
 # Provider (can be overridden by --provider flag, .sandbox.conf, or env)
 SANDBOX_PROVIDER="${SANDBOX_PROVIDER:-claude-code}"
 
@@ -952,7 +971,8 @@ cmd_stop() {
 
     # Restore host .git pointer (cmd_start overwrites it with container-internal paths)
     # This must happen before stop so host-side git works on the worktree afterward.
-    local worktree_path="$(worktree_dir "$project")/${project}--${session}"
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
     local project_path="$SANDBOX_BASE_DIR/$project"
     if [[ -d "$worktree_path" ]]; then
         local worktree_name="${project}--${session}"
@@ -1022,7 +1042,8 @@ cmd_list() {
             # Find the session by looking for worktree meta files
             local project=""
             local session=""
-            for meta in "$SANDBOX_BASE_DIR"/*/.worktrees/*--*.sandbox-meta; do
+            # Search per-project .worktrees/ (current) and legacy global .worktrees/ (backwards compat)
+            for meta in "$SANDBOX_BASE_DIR"/*/.worktrees/*--*.sandbox-meta "$SANDBOX_BASE_DIR"/.worktrees/*--*.sandbox-meta; do
                 [ -f "$meta" ] || continue
                 local wt_name
                 wt_name=$(basename "${meta%.sandbox-meta}")
@@ -1134,7 +1155,7 @@ cmd_shell() {
     validate_session_name "$session"
 
     # Resolve provider from session metadata (persisted at start time)
-    local meta_file="$(worktree_dir "$project")/${project}--${session}.sandbox-meta"
+    local meta_file="$(resolve_worktree "$project" "$session").sandbox-meta"
     local resolved_provider="$SANDBOX_PROVIDER"
     if [[ -f "$meta_file" ]]; then
         local meta_provider
@@ -1156,7 +1177,7 @@ cmd_headless() {
     validate_session_name "$session"
 
     # Resolve provider from session metadata (persisted at start time)
-    local meta_file="$(worktree_dir "$project")/${project}--${session}.sandbox-meta"
+    local meta_file="$(resolve_worktree "$project" "$session").sandbox-meta"
     local resolved_provider="$SANDBOX_PROVIDER"
     if [[ -f "$meta_file" ]]; then
         local meta_provider
@@ -1194,7 +1215,8 @@ cmd_diff() {
     if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
         git_cmd=(docker exec "${comp_name}-agent" git)
     else
-        local worktree_path="$(worktree_dir "$project")/${project}--${session}"
+        local worktree_path
+        worktree_path="$(resolve_worktree "$project" "$session")"
         if [[ ! -d "$worktree_path" ]]; then
             echo "ERROR: No worktree found at $worktree_path" >&2
             exit 1
@@ -1229,7 +1251,8 @@ cmd_repair() {
 
     validate_session_name "$session"
 
-    local worktree_path="$(worktree_dir "$project")/${project}--${session}"
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
     local project_path="$SANDBOX_BASE_DIR/$project"
 
     if [[ ! -d "$worktree_path" ]]; then
@@ -1261,7 +1284,8 @@ cmd_merge() {
         shift
     done
 
-    local worktree_path="$(worktree_dir "$project")/${project}--${session}"
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
     local project_path="$SANDBOX_BASE_DIR/$project"
     local comp_name
     comp_name=$(compose_project_name "$project" "$session")

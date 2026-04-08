@@ -25,6 +25,8 @@ fi
 
 # Defaults — SANDBOX_BASE_DIR defaults to the parent of this repo
 SANDBOX_BASE_DIR="${SANDBOX_BASE_DIR:-$(dirname "$SCRIPT_DIR")}"
+# AGENT_SANDBOX_HOME defaults to this repo's checkout directory
+export AGENT_SANDBOX_HOME="${AGENT_SANDBOX_HOME:-$SCRIPT_DIR}"
 SANDBOX_LOG="$SCRIPT_DIR/sessions.log"
 
 # Worktree directory: per-project (.worktrees inside each project)

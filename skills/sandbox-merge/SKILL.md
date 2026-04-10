@@ -33,7 +33,16 @@ Use this priority order:
 
 4. **If one session found**, use it. **If multiple**, list them and ask the user to choose. **If none**, tell the user no running sandbox was found for this project.
 
-### 2. Merge
+### 2. Pre-Merge Validation
+
+Before merging, the `sandbox.sh merge` command validates that work was actually committed. It will **abort with an error** if:
+
+- **Uncommitted changes exist** in the worktree — the agent may not have finished. The error will suggest `sandbox shell` to reconnect or `sandbox diff` to review.
+- **Zero commits** on the session branch beyond the base — there's nothing to merge. The error will suggest `sandbox shell`, `sandbox logs`, or `sandbox diff`.
+
+If the merge command exits with an error, **relay the error to the user and do NOT proceed to cleanup**. The sandbox is preserved so no work is lost.
+
+### 3. Merge
 
 Run:
 ```bash
@@ -43,6 +52,7 @@ bash "$AGENT_SANDBOX_HOME/sandbox.sh" merge <project> <session>
 This command:
 - Stops the sandbox if running
 - Restores the host git pointer
+- Validates uncommitted changes and commit count (see step 2)
 - Merges the session branch into the project's current branch
 
 **If the merge fails** (conflicts), print the error and tell the user:
@@ -55,7 +65,7 @@ Merge conflict detected. Resolve conflicts in C:\Dev\<project>, then:
 
 Do NOT proceed to cleanup if the merge failed.
 
-### 3. Clean Up
+### 4. Clean Up
 
 Only if the merge succeeded, run:
 ```bash
@@ -67,7 +77,7 @@ This removes:
 - Git worktree
 - Session branch (if fully merged)
 
-### 4. Report
+### 5. Report
 
 Print the result:
 

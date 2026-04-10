@@ -1316,11 +1316,38 @@ cmd_merge() {
     fi
     echo "gitdir: $git_path" > "$worktree_path/.git"
 
+    # Check for uncommitted changes in the worktree (the agent may not have committed)
+    local uncommitted
+    uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
+    if [[ -n "$uncommitted" ]]; then
+        echo "ERROR: Worktree has uncommitted changes:" >&2
+        echo "" >&2
+        git -C "$worktree_path" status --short >&2
+        echo "" >&2
+        echo "The sandbox agent may not have finished committing." >&2
+        echo "Options:" >&2
+        echo "  sandbox shell $project $session   # Reconnect and commit manually" >&2
+        echo "  sandbox diff $project $session     # Review the uncommitted changes" >&2
+        exit 1
+    fi
+
     # Show what will be merged
     local current_branch
     current_branch=$(git -C "$project_path" rev-parse --abbrev-ref HEAD)
     local commit_count
     commit_count=$(git -C "$project_path" rev-list --count "${current_branch}..${branch_name}" 2>/dev/null || echo "0")
+
+    # Abort if there are no commits to merge
+    if [[ "$commit_count" -eq 0 ]]; then
+        echo "ERROR: No commits found on branch '$branch_name' beyond '$current_branch'." >&2
+        echo "" >&2
+        echo "The sandbox produced no committed changes. Nothing to merge." >&2
+        echo "Options:" >&2
+        echo "  sandbox shell $project $session   # Reconnect and check status" >&2
+        echo "  sandbox logs $project $session     # Review agent output" >&2
+        echo "  sandbox diff $project $session     # Check for uncommitted work" >&2
+        exit 1
+    fi
 
     echo "Merging '$branch_name' into '$current_branch' ($commit_count commits)"
     echo ""

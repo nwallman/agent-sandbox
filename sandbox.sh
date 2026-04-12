@@ -1317,6 +1317,25 @@ cmd_merge() {
     fi
     echo "gitdir: $git_path" > "$worktree_path/.git"
 
+    # Clean up sandbox runtime artifacts before checking for uncommitted changes.
+    # The sandbox startup process modifies files (dos2unix on scripts, npm install
+    # creating lockfiles, Gradle build output) that are not real agent work.
+    echo "Cleaning sandbox artifacts..."
+
+    # Reset line-ending-only changes on scripts (dos2unix ran at startup)
+    git -C "$worktree_path" diff --name-only 2>/dev/null | while IFS= read -r f; do
+        # If the only difference is line endings (CR/LF), reset the file
+        if git -C "$worktree_path" diff --ignore-cr-at-eol --quiet -- "$f" 2>/dev/null; then
+            git -C "$worktree_path" checkout -- "$f" 2>/dev/null
+        fi
+    done
+
+    # Remove untracked build artifacts that the sandbox created
+    git -C "$worktree_path" clean -fdq \
+        -- '**/build/' '**/.gradle/' '**/node_modules/' \
+        'package-lock.json' '**/package-lock.json' \
+        2>/dev/null || true
+
     # Check for uncommitted changes in the worktree (the agent may not have committed)
     local uncommitted
     uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)

@@ -38,6 +38,12 @@ docs.oracle.com
 # CDNs — only specific hosts, not broad wildcards
 cdn.jsdelivr.net
 
+# Playwright browser downloads
+playwright.azureedge.net
+playwright-akamai.azureedge.net
+playwright-verizon.azureedge.net
+cdn.playwright.dev
+
 # Docker Hub (for DinD Testcontainers image pulls)
 .docker.io
 .docker.com

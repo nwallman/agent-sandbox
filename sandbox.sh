@@ -825,8 +825,9 @@ GRADLE_EOF
     if [[ "$profile" == "node" || "$profile" == "fullstack" ]]; then
         docker exec "${comp_name}-agent" bash -c '
             if grep -rq "@playwright" /workspace/packages/*/package.json /workspace/package.json 2>/dev/null; then
-                echo "  Installing Playwright browsers..."
-                npx playwright install --with-deps chromium 2>&1 | tail -1
+                echo "  Installing Playwright browsers and system dependencies..."
+                sudo npx playwright install-deps chromium 2>&1 | tail -3
+                npx playwright install chromium 2>&1 | tail -1
             fi
         ' || true
     fi

@@ -1809,6 +1809,181 @@ cmd_pool_status() {
     echo "  Total: $total  Idle: $idle_count  Busy: $busy_count  Reviewing: $reviewing_count"
 }
 
+cmd_pool_assign() {
+    local project=""
+    local plan=""
+    local branch=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branch) branch="$2"; shift 2 ;;
+            *)
+                if [[ -z "$project" ]]; then
+                    project="$1"
+                elif [[ -z "$plan" ]]; then
+                    plan="$1"
+                else
+                    echo "ERROR: Unexpected argument: $1" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$project" || -z "$plan" ]]; then
+        echo "ERROR: pool assign requires <project> <plan-file>" >&2
+        exit 1
+    fi
+
+    local project_path="$SANDBOX_BASE_DIR/$project"
+    if [[ ! -d "$project_path" ]]; then
+        echo "ERROR: Project directory not found: $project_path" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$plan" && ! -f "$project_path/$plan" ]]; then
+        echo "ERROR: Plan file not found: $plan" >&2
+        exit 1
+    fi
+
+    # Resolve plan to absolute path
+    if [[ -f "$project_path/$plan" ]]; then
+        plan="$project_path/$plan"
+    fi
+
+    # Derive branch name from plan filename if not specified
+    if [[ -z "$branch" ]]; then
+        local plan_basename
+        plan_basename=$(basename "$plan" .md)
+        branch=$(echo "$plan_basename" | sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}-//')
+    fi
+    validate_branch_name "$branch"
+
+    # Atomically claim an idle sandbox (writes "busy" under flock)
+    local session
+    session=$(pool_claim_idle "$project")
+
+    if [[ -z "$session" ]]; then
+        echo "ERROR: No idle pool sandbox available for '$project'." >&2
+        echo "Check status: sandbox pool status $project" >&2
+        exit 1
+    fi
+
+    local pdir
+    pdir="$(pool_dir "$project")"
+    local comp_name
+    comp_name=$(compose_project_name "$project" "$session")
+
+    echo "Assigning plan to pool sandbox '$session'..."
+    echo "  Plan:   $(basename "$plan")"
+    echo "  Branch: $branch"
+    echo ""
+
+    # Kill any stale watcher from a previous assignment
+    pool_kill_watcher "$project" "$session"
+
+    # Create worktree for this task
+    local wt_dir
+    wt_dir="$(worktree_dir "$project")"
+    mkdir -p "$wt_dir"
+    local worktree_path="$wt_dir/${project}--${session}"
+
+    # Clean up old worktree if leftover from a previous task
+    if [[ -d "$worktree_path" ]]; then
+        echo "  Cleaning up previous worktree..."
+        git -C "$project_path" config core.longpaths true
+        git -C "$project_path" worktree remove "$worktree_path" --force 2>/dev/null \
+            || rm -rf "$worktree_path"
+    fi
+
+    # Create fresh worktree
+    if ! git -C "$project_path" rev-parse --verify "$branch" &>/dev/null; then
+        git -C "$project_path" branch "$branch"
+    fi
+    git -C "$project_path" worktree add "$worktree_path" "$branch"
+
+    # Stop the container (fast — agent is idle)
+    echo "  Restarting sandbox with new worktree..."
+    docker compose -p "$comp_name" down 2>/dev/null
+    # Wait for container to fully stop before warm restart
+    while docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; do
+        sleep 1
+    done
+
+    # Warm restart with new bind mount — passes --branch so metadata is correct
+    local provider_name
+    provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
+    ( cmd_start "$project" "$session" --warm --branch "$branch" --provider "$provider_name" --dangerous )
+
+    # Record task metadata
+    echo "$plan" > "$pdir/${session}.plan"
+    echo "$branch" > "$pdir/${session}.branch"
+    # State is already "busy" from pool_claim_idle
+
+    echo ""
+    echo "Pool sandbox '$session' is now working on branch '$branch'."
+    echo ""
+    echo "  Check status:  sandbox pool status $project"
+    echo "  View logs:     sandbox logs $project $session"
+    echo "  Cancel:        sandbox pool cancel $project $session"
+
+    # Start background completion watcher with PID tracking
+    _pool_start_watcher "$project" "$session" "$comp_name" &
+    local watcher_pid=$!
+    echo "$watcher_pid" > "$pdir/${session}.watcher-pid"
+    disown "$watcher_pid"
+}
+
+_pool_start_watcher() {
+    local project="$1"
+    local session="$2"
+    local comp_name="$3"
+
+    # Determine agent process name from provider hook (or default)
+    local process_pattern="[c]laude"
+    if type provider_process_name &>/dev/null; then
+        local raw_pattern
+        raw_pattern=$(provider_process_name)
+        # Apply bracket trick: "claude" -> "[c]laude" to exclude pgrep itself
+        process_pattern="[${raw_pattern:0:1}]${raw_pattern:1}"
+    fi
+
+    # Wait for the agent process to appear (max 60 seconds)
+    local waited=0
+    while [[ $waited -lt 60 ]]; do
+        if docker exec "${comp_name}-agent" pgrep -f "$process_pattern" &>/dev/null; then
+            break
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    # Poll until agent process exits
+    while true; do
+        sleep 10
+        # Check container is still running
+        if ! docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+            pool_write_state "$project" "$session" "failed"
+            rm -f "$(pool_dir "$project")/${session}.watcher-pid"
+            return
+        fi
+        # Check if agent process is still running
+        if ! docker exec "${comp_name}-agent" pgrep -f "$process_pattern" &>/dev/null; then
+            pool_write_state "$project" "$session" "reviewing"
+            rm -f "$(pool_dir "$project")/${session}.watcher-pid"
+            # Send Windows desktop notification
+            powershell.exe -Command "
+                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+                \$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(0)
+                \$xml.GetElementsByTagName('text')[0].AppendChild(\$xml.CreateTextNode('Sandbox $session finished work on $project')) | Out-Null
+                [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Agent Sandbox').Show([Windows.UI.Notifications.ToastNotification]::new(\$xml))
+            " 2>/dev/null &
+            return
+        fi
+    done
+}
+
 # --- Main ---
 
 if [[ $# -eq 0 ]]; then

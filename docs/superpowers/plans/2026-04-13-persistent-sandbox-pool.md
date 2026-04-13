@@ -4,22 +4,25 @@
 
 **Goal:** Add a persistent sandbox pool system so containers stay warm between features, reducing per-feature startup from minutes to seconds.
 
-**Architecture:** New `sandbox pool` subcommands in `sandbox.sh` manage pool state via simple files in `<project>/.pool/`. Pool sandboxes are normal sandboxes with state tracking. A `SANDBOX_WARM=true` env var gates expensive post-launch init steps. Three skills (`sandbox-pool`, `sandbox-accept`, updated `sandbox-execute`) provide the user-facing workflow.
+**Architecture:** New `sandbox pool` subcommands in `sandbox.sh` manage pool state via simple files in `<project>/.pool/`. Pool sandboxes are normal sandboxes with state tracking. A `--warm` flag on `cmd_start` skips expensive post-launch init. Merge logic is extracted into a shared `_do_merge` helper used by both `cmd_merge` and `cmd_pool_accept`. Three skills (`sandbox-pool`, `sandbox-accept`, updated `sandbox-execute`) provide the user-facing workflow.
 
 **Tech Stack:** Bash (sandbox.sh), Markdown (SKILL.md files), Docker Compose, PowerShell (sandbox.ps1 wrapper)
+
+**Architectural decisions from review:**
+- `--warm` flag on `cmd_start` instead of `SANDBOX_WARM` env var (avoids export leak, EXIT trap collision, "already running" early exit)
+- No intermediate "claiming" state — write "busy" directly under flock (simpler, no orphan states)
+- Shared `_do_merge` helper instead of duplicating merge logic (single source of truth for artifact cleanup)
+- Watcher PIDs tracked in state dir and killed on cancel/stop/reassign (prevents stale watchers)
+- `pgrep -f "[c]laude"` bracket trick to exclude pgrep itself from matching
 
 ---
 
 ### Task 1: Add Pool State Helper Functions to sandbox.sh
 
 **Files:**
-- Modify: `sandbox.sh:27-62` (after existing helper section)
+- Modify: `sandbox.sh` (insert after `validate_branch_name()` ~line 236, before `validate_env_pair()`)
 
-This task adds the low-level functions that all pool commands depend on: state directory management, state read/write with flock-based concurrency, and pool sandbox discovery.
-
-- [ ] **Step 1: Add pool directory and state helper functions after the existing helper block**
-
-Insert after `validate_branch_name()` (line 236) and before `validate_env_pair()` (line 238):
+- [ ] **Step 1: Add pool state helpers**
 
 ```bash
 # --- Pool state helpers ---
@@ -48,10 +51,11 @@ pool_write_state() {
     ) 200>"${state_file}.lock"
 }
 
-# Find the first idle pool sandbox for a project
-# Usage: pool_find_idle <project>
+# Atomically find and claim the first idle pool sandbox by writing "busy" under flock.
+# Usage: pool_claim_idle <project>
 # Returns: session name (or empty if none idle)
-pool_find_idle() {
+# Side effect: sets claimed sandbox state to "busy"
+pool_claim_idle() {
     local pdir
     pdir="$(pool_dir "$1")"
     [[ -d "$pdir" ]] || return 0
@@ -59,36 +63,21 @@ pool_find_idle() {
         [[ -f "$state_file" ]] || continue
         local session
         session=$(basename "${state_file%.state}")
-        (
-            flock -n 200 || exit 1
+        # Atomic read-and-claim under exclusive flock
+        local claimed
+        claimed=$(
+            flock -x 200
             local state
-            state=$(cat "$state_file")
+            state=$(cat "$state_file" 2>/dev/null)
             if [[ "$state" == "idle" ]]; then
+                echo "busy" > "$state_file"
                 echo "$session"
-                exit 0
             fi
         ) 200>"${state_file}.lock"
-        # If the subshell printed a session name, we found one
-        local result
-        result=$(
-            flock -n "${state_file}.lock" bash -c "cat '$state_file'" 2>/dev/null
-        )
-        if [[ "$(cat "$state_file" 2>/dev/null)" == "idle" ]]; then
-            echo "$session"
+        if [[ -n "$claimed" ]]; then
+            echo "$claimed"
             return 0
         fi
-    done
-}
-
-# List all pool sessions for a project
-# Usage: pool_list_sessions <project>
-pool_list_sessions() {
-    local pdir
-    pdir="$(pool_dir "$1")"
-    [[ -d "$pdir" ]] || return 0
-    for state_file in "$pdir"/pool-*.state; do
-        [[ -f "$state_file" ]] || continue
-        basename "${state_file%.state}"
     done
 }
 
@@ -98,6 +87,18 @@ pool_list_sessions() {
 is_pool_sandbox() {
     local state_file="$(pool_dir "$1")/$2.state"
     [[ -f "$state_file" ]]
+}
+
+# Kill a running watcher process for a pool sandbox
+# Usage: pool_kill_watcher <project> <session>
+pool_kill_watcher() {
+    local pid_file="$(pool_dir "$1")/$2.watcher-pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
 }
 ```
 
@@ -115,100 +116,127 @@ git commit -m "feat: add pool state helper functions to sandbox.sh"
 
 ---
 
-### Task 2: Add `pool_find_idle` with Proper flock-based Locking
+### Task 2: Add `--warm` Flag to `cmd_start`
 
 **Files:**
-- Modify: `sandbox.sh` (the `pool_find_idle` function from Task 1)
+- Modify: `sandbox.sh` (the `cmd_start` function, lines 378-956)
 
-The flock approach in Task 1 is simplified. Replace `pool_find_idle` with a version that does atomic claim — read state and write "claiming" in a single locked block so two concurrent `assign` calls can't both find the same idle sandbox.
+The `--warm` flag makes `cmd_start` safe for pool usage by:
+1. Skipping the "already running → exit 0" early return
+2. Skipping worktree creation (caller already created it)
+3. Skipping image builds (already built on cold start)
+4. Skipping expensive post-launch init (deps, ownership, dos2unix, playwright, gradle cache)
+5. Always running: provider_start, .git pointer rewrite, .env seeding
 
-- [ ] **Step 1: Replace pool_find_idle with atomic claim version**
+- [ ] **Step 1: Add `--warm` flag to arg parsing**
 
-Replace the `pool_find_idle` function written in Task 1 with:
+Find the arg parsing block in `cmd_start` (around line 396):
 
 ```bash
-# Find and atomically claim the first idle pool sandbox
-# Usage: pool_claim_idle <project>
-# Returns: session name (or empty if none idle)
-# Side effect: sets claimed sandbox state to "claiming"
-pool_claim_idle() {
-    local pdir
-    pdir="$(pool_dir "$1")"
-    [[ -d "$pdir" ]] || return 0
-    for state_file in "$pdir"/pool-*.state; do
-        [[ -f "$state_file" ]] || continue
-        local session
-        session=$(basename "${state_file%.state}")
-        # Atomic read-and-claim under flock
-        local claimed
-        claimed=$(
-            flock -x 200
-            local state
-            state=$(cat "$state_file" 2>/dev/null)
-            if [[ "$state" == "idle" ]]; then
-                echo "claiming" > "$state_file"
-                echo "$session"
-            fi
-        ) 200>"${state_file}.lock"
-        if [[ -n "$claimed" ]]; then
-            echo "$claimed"
-            return 0
-        fi
-    done
-}
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) profile="$2"; shift 2 ;;
+            --branch) branch="$2"; shift 2 ;;
+            --provider) provider="$2"; shift 2 ;;
+            --env) extra_env+=("$2"); shift 2 ;;
+            --dangerous) dangerous=true; shift ;;
+            --read-only) read_only=true; shift ;;
+            --open-network) open_network=true; shift ;;
+            --docker) docker=true; shift ;;
 ```
 
-Also remove the original `pool_find_idle` function.
-
-- [ ] **Step 2: Verify no syntax errors**
-
-Run: `bash -n sandbox.sh`
-Expected: No output (clean parse)
-
-- [ ] **Step 3: Commit**
+Add `--warm` to the case block:
 
 ```bash
-git add sandbox.sh
-git commit -m "feat: replace pool_find_idle with atomic pool_claim_idle"
+            --warm) warm=true; shift ;;
 ```
 
----
-
-### Task 3: Add SANDBOX_WARM Gate to Post-Launch Init
-
-**Files:**
-- Modify: `sandbox.sh:770-938` (the post-launch init block in `cmd_start`)
-
-This wraps the expensive initialization steps in a `SANDBOX_WARM` check. The warm restart still runs provider_start, .git pointer rewrite, and .env seeding.
-
-- [ ] **Step 1: Wrap cold-only init steps with SANDBOX_WARM check**
-
-In `cmd_start`, after the `docker compose up -d` line (line 768) and the ownership fixup block (lines 770-777), wrap the cold-only steps. The section starting at line 782 (Gradle cache seeding) through line 837 (dos2unix) needs the gate. Provider start (line 780) must always run.
-
-Find this block (around line 770):
+And add the variable initialization before the while loop (alongside the other `local` declarations around line 384):
 
 ```bash
-    # Fix ownership on session-local volumes (created as root by Docker)
-    if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
-        docker exec -u root "${comp_name}-agent" bash -c \
-            "chown agent:agent /home/agent/.gradle /build-output || true"
+    local warm=false
+```
+
+- [ ] **Step 2: Make the "already running" check respect --warm**
+
+Find the early exit check (around line 507):
+
+```bash
+    # Check if already running
+    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+        echo "Sandbox '$comp_name' is already running."
+        echo "Use 'sandbox shell $project $session' to connect."
+        exit 0
     fi
-    # Fix ownership on node_modules volumes (created as root by Docker)
-    docker exec -u root "${comp_name}-agent" bash -c \
-        'for d in /workspace/node_modules /workspace/*/node_modules; do [ -d "$d" ] && chown agent:agent "$d"; done' 2>/dev/null || true
-
-    # Provider-specific post-start initialization
-    provider_start "${comp_name}-agent" "$dangerous"
 ```
 
 Replace with:
 
 ```bash
-    # --- Post-launch initialization ---
-    # SANDBOX_WARM=true skips expensive cold-start steps (deps, ownership, etc.)
-    # Always runs: provider_start, .git pointer rewrite, .env seeding
+    # Check if already running (--warm skips this — pool restarts intentionally)
+    if [[ "$warm" == "false" ]]; then
+        if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+            echo "Sandbox '$comp_name' is already running."
+            echo "Use 'sandbox shell $project $session' to connect."
+            exit 0
+        fi
+    fi
+```
 
-    if [[ "${SANDBOX_WARM:-false}" != "true" ]]; then
+- [ ] **Step 3: Skip worktree creation when --warm**
+
+Find the worktree creation block (around line 472):
+
+```bash
+    # Create or reuse git worktree for session isolation
+    local wt_dir
+    wt_dir="$(worktree_dir "$project")"
+    mkdir -p "$wt_dir"
+```
+
+Wrap the entire worktree block (through line 493) with:
+
+```bash
+    if [[ "$warm" == "false" ]]; then
+        # Create or reuse git worktree for session isolation
+        local wt_dir
+        wt_dir="$(worktree_dir "$project")"
+        ...existing worktree creation code...
+    fi
+```
+
+The `.sandbox-meta` write and profile detection that follow the worktree block must still run. The worktree_path variable is needed later, so compute it outside the warm gate:
+
+```bash
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
+
+    if [[ "$warm" == "false" ]]; then
+        # Create or reuse git worktree...
+        ...
+    fi
+
+    # Store branch name and provider (always, in case --warm changed branch)
+    printf '%s\n%s\n' "$branch" "$provider" > "${worktree_path}.sandbox-meta"
+```
+
+- [ ] **Step 4: Skip image builds when --warm**
+
+Find the image build section (around line 514). Wrap everything from "Build base image if needed" through "Build dind image if needed" (through line 552) with:
+
+```bash
+    if [[ "$warm" == "false" ]]; then
+        # Build base image if needed
+        ...existing image build code...
+    fi
+```
+
+- [ ] **Step 5: Gate expensive post-launch init with --warm**
+
+After `docker compose up -d` (line 768), the init sequence begins. Wrap the cold-only blocks:
+
+```bash
+    if [[ "$warm" == "false" ]]; then
         # Fix ownership on session-local volumes (created as root by Docker)
         if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
             docker exec -u root "${comp_name}-agent" bash -c \
@@ -221,57 +249,246 @@ Replace with:
 
     # Provider-specific post-start initialization (always runs — re-seeds auth)
     provider_start "${comp_name}-agent" "$dangerous"
-```
 
-- [ ] **Step 2: Wrap the Gradle cache seeding, Playwright, dos2unix, and npm install blocks**
+    if [[ "$warm" == "false" ]]; then
+        # Gradle cache seeding from host
+        ...existing gradle cache seeding block...
 
-Find the Gradle cache seeding block (starts around line 782 with `if [[ "$profile" == "java" ...`) that includes:
-- Gradle cache seeding from host
-- Gradle performance tuning
-- Testcontainers config
-- Playwright browser install
-- dos2unix
+        # Gradle performance tuning
+        ...existing gradle performance block...
 
-Wrap all of these (from Gradle cache seeding through the dos2unix line) with:
+        # Testcontainers config
+        ...existing testcontainers block...
 
-```bash
-    if [[ "${SANDBOX_WARM:-false}" != "true" ]]; then
-```
+        # Playwright browser install
+        ...existing playwright block...
 
-And close it just before the `.git` pointer rewrite line (`local worktree_name="${project}--${session}"`):
-
-```bash
-    fi  # end SANDBOX_WARM gate
-```
-
-The `.git` pointer rewrite, `.env` seeding, and npm install sections must remain OUTSIDE the warm gate (they always run because each new worktree needs them). However, npm install can be skipped on warm restart since volumes persist — wrap only the npm install block:
-
-```bash
-    if [[ "${SANDBOX_WARM:-false}" != "true" ]]; then
-        # npm install in any directory with package.json but no node_modules
-        ...existing npm install block...
+        # dos2unix
+        ...existing dos2unix block...
     fi
 ```
 
-The Gradle dependency resolution block should also be inside the warm gate since the cache volume persists.
+The `.git` pointer rewrite and `.env` seeding must ALWAYS run (outside the gate) since each new worktree needs them.
+
+For the npm install and Gradle dependency resolution blocks, wrap them with the warm gate. **Important:** Guard the `wait` calls to avoid referencing undefined PID variables:
+
+```bash
+    if [[ "$warm" == "false" && "$read_only" == "false" ]]; then
+        # npm install
+        docker exec "${comp_name}-agent" bash -c '...' &
+        local npm_pid=$!
+
+        # Gradle build output symlinks
+        docker exec "${comp_name}-agent" bash -c '...'
+
+        # Gradle dependency resolution
+        docker exec "${comp_name}-agent" bash -c '...' &
+        local gradle_pid=$!
+
+        # Wait for npm
+        wait $npm_pid 2>/dev/null || true
+    fi
+```
+
+Remove the old standalone `wait $npm_pid` line that's outside the block.
+
+- [ ] **Step 6: Verify no syntax errors**
+
+Run: `bash -n sandbox.sh`
+Expected: No output (clean parse)
+
+- [ ] **Step 7: Test cold start still works**
+
+Run: `bash sandbox.sh start <test-project> test-cold --provider claude-code`
+Expected: Full init runs (npm install, ownership fixups, etc.)
+Run: `bash sandbox.sh stop <test-project> test-cold --clean`
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add sandbox.sh
+git commit -m "feat: add --warm flag to cmd_start for pool warm restarts"
+```
+
+---
+
+### Task 3: Extract `_do_merge` Helper from `cmd_merge`
+
+**Files:**
+- Modify: `sandbox.sh` (refactor `cmd_merge` at lines 1273-1415)
+
+Extract the core merge logic (artifact cleanup, validation, merge) into a shared function. Both `cmd_merge` and the later `cmd_pool_accept` will call this.
+
+- [ ] **Step 1: Create `_do_merge` function**
+
+Insert before `cmd_merge`:
+
+```bash
+# Shared merge logic: clean artifacts, validate, merge branch.
+# Does NOT stop containers or remove worktrees — callers handle lifecycle.
+# Usage: _do_merge <project_path> <worktree_path> <branch_name>
+# Returns: 0 on success, 1 on failure (uncommitted changes, no commits, conflicts)
+_do_merge() {
+    local project_path="$1"
+    local worktree_path="$2"
+    local branch_name="$3"
+
+    # Restore .git pointer
+    local worktree_name
+    worktree_name=$(basename "$worktree_path")
+    local git_path="$project_path/.git/worktrees/$worktree_name"
+    if [[ "$git_path" =~ ^/([a-zA-Z])/ ]]; then
+        git_path="${BASH_REMATCH[1]^}:${git_path:2}"
+    fi
+    echo "gitdir: $git_path" > "$worktree_path/.git"
+
+    # Clean sandbox artifacts
+    echo "Cleaning sandbox artifacts..."
+    local artifact_patterns=(
+        '*.sh' 'gradlew' 'gradlew.bat'
+        'openapi.json' '*/openapi.json'
+        'package-lock.json' '*/package-lock.json'
+        'pnpm-lock.yaml' '*/pnpm-lock.yaml'
+        'yarn.lock' '*/yarn.lock'
+    )
+    git -C "$worktree_path" diff --name-only 2>/dev/null | while IFS= read -r f; do
+        local is_artifact=false
+        if git -C "$worktree_path" diff --ignore-cr-at-eol --quiet -- "$f" 2>/dev/null; then
+            is_artifact=true
+        fi
+        for pat in "${artifact_patterns[@]}"; do
+            # shellcheck disable=SC2254
+            case "$f" in $pat) is_artifact=true ;; esac
+        done
+        if [[ "$is_artifact" == "true" ]]; then
+            git -C "$worktree_path" checkout -- "$f" 2>/dev/null
+        fi
+    done
+
+    find "$worktree_path" -maxdepth 3 -type d \( -name 'build' -o -name '.gradle' \) \
+        -exec rm -rf {} + 2>/dev/null || true
+    find "$worktree_path" -maxdepth 2 -name 'package-lock.json' -newer "$worktree_path/.git" \
+        -exec rm -f {} + 2>/dev/null || true
+
+    # Validate: uncommitted changes
+    local uncommitted
+    uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
+    if [[ -n "$uncommitted" ]]; then
+        echo "ERROR: Worktree has uncommitted changes:" >&2
+        git -C "$worktree_path" status --short >&2
+        return 1
+    fi
+
+    # Validate: commits exist
+    local current_branch
+    current_branch=$(git -C "$project_path" rev-parse --abbrev-ref HEAD)
+    local commit_count
+    commit_count=$(git -C "$project_path" rev-list --count "${current_branch}..${branch_name}" 2>/dev/null || echo "0")
+    if [[ "$commit_count" -eq 0 ]]; then
+        echo "ERROR: No commits found on branch '$branch_name' beyond '$current_branch'." >&2
+        return 1
+    fi
+
+    echo "Merging '$branch_name' into '$current_branch' ($commit_count commits)"
+    echo ""
+    git --no-pager -C "$project_path" diff --stat "${current_branch}...${branch_name}" 2>/dev/null
+    echo ""
+
+    # Perform the merge
+    if ! git -C "$project_path" merge "$branch_name" --no-edit; then
+        echo "Merge failed (conflicts?). Resolve in: $project_path"
+        return 1
+    fi
+
+    echo "Merge complete. Branch '$branch_name' merged into '$current_branch'."
+    return 0
+}
+```
+
+- [ ] **Step 2: Refactor `cmd_merge` to use `_do_merge`**
+
+Replace the body of `cmd_merge` (from the "Stop the sandbox" section through the merge) with calls to `_do_merge`. Keep the existing arg parsing, worktree/branch resolution, and the stop/cleanup logic:
+
+```bash
+cmd_merge() {
+    local project="$1"
+    local session="$2"
+    shift 2
+
+    validate_session_name "$session"
+
+    local clean=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --clean) clean=true ;;
+        esac
+        shift
+    done
+
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
+    local project_path="$SANDBOX_BASE_DIR/$project"
+    local comp_name
+    comp_name=$(compose_project_name "$project" "$session")
+
+    if [[ ! -d "$worktree_path" ]]; then
+        echo "ERROR: No worktree found at $worktree_path" >&2
+        exit 1
+    fi
+
+    local branch_name="$session"
+    if [[ -f "${worktree_path}.sandbox-meta" ]]; then
+        branch_name=$(sed -n '1p' "${worktree_path}.sandbox-meta")
+    fi
+
+    # Stop the sandbox if running
+    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+        echo "Stopping sandbox first..."
+        cmd_stop "$project" "$session"
+        echo ""
+    fi
+
+    # Run shared merge logic
+    if ! _do_merge "$project_path" "$worktree_path" "$branch_name"; then
+        echo ""
+        echo "Options:"
+        echo "  sandbox shell $project $session   # Reconnect"
+        echo "  sandbox diff $project $session     # Review changes"
+        exit 1
+    fi
+
+    if [[ "$clean" == "true" ]]; then
+        echo ""
+        echo "Cleaning up sandbox..."
+        cmd_stop "$project" "$session" --clean
+    else
+        echo ""
+        echo "Next steps:"
+        echo "  sandbox stop $project $session --clean   # Remove worktree, volumes, and branch"
+    fi
+}
+```
 
 - [ ] **Step 3: Verify no syntax errors**
 
 Run: `bash -n sandbox.sh`
 Expected: No output (clean parse)
 
-- [ ] **Step 4: Test cold start still works**
+- [ ] **Step 4: Test that existing merge still works**
 
-Run: `bash sandbox.sh start <test-project> test-cold-start --provider claude-code`
-Expected: Full init runs (npm install, ownership fixups, etc.)
-
-Run: `bash sandbox.sh stop <test-project> test-cold-start --clean`
+Start a sandbox, make a commit inside it, then merge:
+```bash
+bash sandbox.sh start <test-project> test-merge
+# ... make a change and commit inside the sandbox ...
+bash sandbox.sh merge <test-project> test-merge --clean
+```
+Expected: Merges successfully, cleans up
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add sandbox.sh
-git commit -m "feat: add SANDBOX_WARM gate to skip expensive init on warm restart"
+git commit -m "refactor: extract _do_merge helper from cmd_merge"
 ```
 
 ---
@@ -279,11 +496,9 @@ git commit -m "feat: add SANDBOX_WARM gate to skip expensive init on warm restar
 ### Task 4: Implement `cmd_pool_start`
 
 **Files:**
-- Modify: `sandbox.sh` (add new function before `# --- Main ---` section, around line 1550)
+- Modify: `sandbox.sh` (add before `# --- Main ---` section)
 
 - [ ] **Step 1: Add cmd_pool_start function**
-
-Insert before the `# --- Main ---` comment:
 
 ```bash
 # --- Pool commands ---
@@ -354,14 +569,16 @@ cmd_pool_start() {
             comp_name=$(compose_project_name "$project" "$session")
             if ! docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
                 echo "  Restarting container for '$session'..."
-                cmd_start "$project" "$session" "${start_args[@]}"
+                # Run in subshell to isolate cmd_start EXIT trap
+                ( cmd_start "$project" "$session" "${start_args[@]}" )
                 pool_write_state "$project" "$session" "idle"
             fi
             continue
         fi
 
         echo "  Starting pool sandbox: $session"
-        cmd_start "$project" "$session" "${start_args[@]}"
+        # Run in subshell to isolate cmd_start EXIT trap (M1 fix)
+        ( cmd_start "$project" "$session" "${start_args[@]}" )
 
         # Write initial pool state
         pool_write_state "$project" "$session" "idle"
@@ -444,7 +661,7 @@ cmd_pool_status() {
             container_status="stopped"
         fi
 
-        # Cross-reference: state says busy/idle but container is down
+        # Cross-reference: state says busy but container is down
         local flag=""
         if [[ "$container_status" == "stopped" && "$state" == "busy" ]]; then
             state="failed"
@@ -499,7 +716,7 @@ git commit -m "feat: implement cmd_pool_status"
 **Files:**
 - Modify: `sandbox.sh` (add after `cmd_pool_status`)
 
-This is the core command — claims an idle sandbox, creates a worktree, does a warm restart with the new bind mount, and starts the agent with the plan.
+This is the core command — claims an idle sandbox (atomically via `pool_claim_idle`), creates a worktree, does a warm restart with `cmd_start --warm`, and starts a background completion watcher with tracked PID.
 
 - [ ] **Step 1: Add cmd_pool_assign function**
 
@@ -551,12 +768,11 @@ cmd_pool_assign() {
     if [[ -z "$branch" ]]; then
         local plan_basename
         plan_basename=$(basename "$plan" .md)
-        # Strip YYYY-MM-DD- prefix
         branch=$(echo "$plan_basename" | sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}-//')
     fi
     validate_branch_name "$branch"
 
-    # Claim an idle sandbox
+    # Atomically claim an idle sandbox (writes "busy" under flock)
     local session
     session=$(pool_claim_idle "$project")
 
@@ -575,6 +791,9 @@ cmd_pool_assign() {
     echo "  Plan:   $(basename "$plan")"
     echo "  Branch: $branch"
     echo ""
+
+    # Kill any stale watcher from a previous assignment
+    pool_kill_watcher "$project" "$session"
 
     # Create worktree for this task
     local wt_dir
@@ -595,24 +814,24 @@ cmd_pool_assign() {
         git -C "$project_path" branch "$branch"
     fi
     git -C "$project_path" worktree add "$worktree_path" "$branch"
-    printf '%s\n%s\n' "$branch" "$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")" \
-        > "${worktree_path}.sandbox-meta"
 
     # Stop the container (fast — agent is idle)
     echo "  Restarting sandbox with new worktree..."
-    docker compose -p "$comp_name" down 2>/dev/null || true
+    docker compose -p "$comp_name" down 2>/dev/null
+    # Wait for container to fully stop before warm restart
+    while docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; do
+        sleep 1
+    done
 
-    # Warm restart with new bind mount
-    export SANDBOX_WARM=true
+    # Warm restart with new bind mount — passes --branch so metadata is correct
     local provider_name
     provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-    cmd_start "$project" "$session" --provider "$provider_name" --dangerous
-    unset SANDBOX_WARM
+    ( cmd_start "$project" "$session" --warm --branch "$branch" --provider "$provider_name" --dangerous )
 
     # Record task metadata
     echo "$plan" > "$pdir/${session}.plan"
     echo "$branch" > "$pdir/${session}.branch"
-    pool_write_state "$project" "$session" "busy"
+    # State is already "busy" from pool_claim_idle
 
     echo ""
     echo "Pool sandbox '$session' is now working on branch '$branch'."
@@ -621,11 +840,17 @@ cmd_pool_assign() {
     echo "  View logs:     sandbox logs $project $session"
     echo "  Cancel:        sandbox pool cancel $project $session"
 
-    # Start background completion watcher
+    # Start background completion watcher with PID tracking
     _pool_start_watcher "$project" "$session" "$comp_name" &
-    disown
+    local watcher_pid=$!
+    echo "$watcher_pid" > "$pdir/${session}.watcher-pid"
+    disown "$watcher_pid"
 }
+```
 
+- [ ] **Step 2: Add the background watcher function**
+
+```bash
 # Background watcher: polls for agent process exit, flips state to "reviewing"
 _pool_start_watcher() {
     local project="$1"
@@ -633,9 +858,12 @@ _pool_start_watcher() {
     local comp_name="$3"
 
     # Determine agent process name from provider hook (or default)
-    local process_pattern="claude"
+    local process_pattern="[c]laude"
     if type provider_process_name &>/dev/null; then
-        process_pattern=$(provider_process_name)
+        local raw_pattern
+        raw_pattern=$(provider_process_name)
+        # Apply bracket trick: "claude" -> "[c]laude" to exclude pgrep itself
+        process_pattern="[${raw_pattern:0:1}]${raw_pattern:1}"
     fi
 
     # Wait for the agent process to appear (max 60 seconds)
@@ -654,11 +882,13 @@ _pool_start_watcher() {
         # Check container is still running
         if ! docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
             pool_write_state "$project" "$session" "failed"
+            rm -f "$(pool_dir "$project")/${session}.watcher-pid"
             return
         fi
         # Check if agent process is still running
         if ! docker exec "${comp_name}-agent" pgrep -f "$process_pattern" &>/dev/null; then
             pool_write_state "$project" "$session" "reviewing"
+            rm -f "$(pool_dir "$project")/${session}.watcher-pid"
             # Send Windows desktop notification
             powershell.exe -Command "
                 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -672,12 +902,12 @@ _pool_start_watcher() {
 }
 ```
 
-- [ ] **Step 2: Verify no syntax errors**
+- [ ] **Step 3: Verify no syntax errors**
 
 Run: `bash -n sandbox.sh`
 Expected: No output (clean parse)
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add sandbox.sh
@@ -691,9 +921,9 @@ git commit -m "feat: implement cmd_pool_assign with warm restart and completion 
 **Files:**
 - Modify: `sandbox.sh` (add after `cmd_pool_assign`)
 
-- [ ] **Step 1: Add cmd_pool_accept function**
+`cmd_pool_accept` uses `_do_merge` (from Task 3) for the merge logic, and wraps state read+write under flock to prevent race conditions.
 
-Note: We cannot call `cmd_merge` because it calls `cmd_stop` which tears down the container. For pool sandboxes, we need to do the merge logic inline, handling the stop/restart ourselves to keep the container warm.
+- [ ] **Step 1: Add cmd_pool_accept function**
 
 ```bash
 cmd_pool_accept() {
@@ -705,15 +935,28 @@ cmd_pool_accept() {
         exit 1
     fi
 
-    local state
-    state=$(pool_read_state "$project" "$session")
-    if [[ "$state" != "reviewing" ]]; then
+    # Atomic state check under flock (M2 fix)
+    local pdir
+    pdir="$(pool_dir "$project")"
+    local state_file="$pdir/${session}.state"
+    local verified
+    verified=$(
+        flock -x 200
+        local state
+        state=$(cat "$state_file" 2>/dev/null)
+        if [[ "$state" == "reviewing" ]]; then
+            echo "accepting" > "$state_file"
+            echo "yes"
+        fi
+    ) 200>"${state_file}.lock"
+
+    if [[ "$verified" != "yes" ]]; then
+        local state
+        state=$(pool_read_state "$project" "$session")
         echo "ERROR: Pool sandbox '$session' is in state '$state', not 'reviewing'." >&2
         exit 1
     fi
 
-    local pdir
-    pdir="$(pool_dir "$project")"
     local project_path="$SANDBOX_BASE_DIR/$project"
     local worktree_path
     worktree_path="$(resolve_worktree "$project" "$session")"
@@ -725,94 +968,25 @@ cmd_pool_accept() {
 
     echo "Merging pool sandbox '$session' (branch: $branch_name)..."
 
+    # Kill watcher if still running
+    pool_kill_watcher "$project" "$session"
+
     # Stop container to restore git pointer for host-side merge
     if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
         cmd_stop "$project" "$session"
     fi
 
-    # Restore .git pointer (same as cmd_merge)
-    local worktree_name="${project}--${session}"
-    local git_path="$project_path/.git/worktrees/$worktree_name"
-    if [[ "$git_path" =~ ^/([a-zA-Z])/ ]]; then
-        git_path="${BASH_REMATCH[1]^}:${git_path:2}"
-    fi
-    echo "gitdir: $git_path" > "$worktree_path/.git"
-
-    # Clean sandbox artifacts (same patterns as cmd_merge)
-    echo "Cleaning sandbox artifacts..."
-    local artifact_patterns=(
-        '*.sh' 'gradlew' 'gradlew.bat'
-        'openapi.json' '*/openapi.json'
-        'package-lock.json' '*/package-lock.json'
-        'pnpm-lock.yaml' '*/pnpm-lock.yaml'
-        'yarn.lock' '*/yarn.lock'
-    )
-    git -C "$worktree_path" diff --name-only 2>/dev/null | while IFS= read -r f; do
-        local is_artifact=false
-        if git -C "$worktree_path" diff --ignore-cr-at-eol --quiet -- "$f" 2>/dev/null; then
-            is_artifact=true
-        fi
-        for pat in "${artifact_patterns[@]}"; do
-            case "$f" in $pat) is_artifact=true ;; esac
-        done
-        if [[ "$is_artifact" == "true" ]]; then
-            git -C "$worktree_path" checkout -- "$f" 2>/dev/null
-        fi
-    done
-    find "$worktree_path" -maxdepth 3 -type d \( -name 'build' -o -name '.gradle' \) \
-        -exec rm -rf {} + 2>/dev/null || true
-    find "$worktree_path" -maxdepth 2 -name 'package-lock.json' -newer "$worktree_path/.git" \
-        -exec rm -f {} + 2>/dev/null || true
-
-    # Validate: check for uncommitted changes
-    local uncommitted
-    uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
-    if [[ -n "$uncommitted" ]]; then
-        echo "ERROR: Worktree has uncommitted changes:" >&2
-        git -C "$worktree_path" status --short >&2
-        echo "Reconnect with: sandbox shell $project $session" >&2
-        # Restart container so user can shell in
+    # Use shared merge logic
+    if ! _do_merge "$project_path" "$worktree_path" "$branch_name"; then
+        echo ""
+        echo "Reconnect with: sandbox shell $project $session"
+        # Restart container so user can fix
         local provider_name
         provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-        export SANDBOX_WARM=true
-        cmd_start "$project" "$session" --provider "$provider_name" --dangerous
-        unset SANDBOX_WARM
+        ( cmd_start "$project" "$session" --warm --branch "$branch_name" --provider "$provider_name" --dangerous )
+        pool_write_state "$project" "$session" "reviewing"
         exit 1
     fi
-
-    # Validate: check for commits
-    local current_branch
-    current_branch=$(git -C "$project_path" rev-parse --abbrev-ref HEAD)
-    local commit_count
-    commit_count=$(git -C "$project_path" rev-list --count "${current_branch}..${branch_name}" 2>/dev/null || echo "0")
-    if [[ "$commit_count" -eq 0 ]]; then
-        echo "ERROR: No commits on branch '$branch_name'." >&2
-        # Restart container
-        local provider_name
-        provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-        export SANDBOX_WARM=true
-        cmd_start "$project" "$session" --provider "$provider_name" --dangerous
-        unset SANDBOX_WARM
-        exit 1
-    fi
-
-    echo "Merging '$branch_name' into '$current_branch' ($commit_count commits)"
-    git --no-pager -C "$project_path" diff --stat "${current_branch}...${branch_name}" 2>/dev/null
-    echo ""
-
-    if ! git -C "$project_path" merge "$branch_name" --no-edit; then
-        echo "Merge failed (conflicts?). Resolve in: $project_path"
-        echo "After resolving, run: sandbox pool accept $project $session"
-        # Restart container to keep pool warm
-        local provider_name
-        provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-        export SANDBOX_WARM=true
-        cmd_start "$project" "$session" --provider "$provider_name" --dangerous
-        unset SANDBOX_WARM
-        exit 1
-    fi
-
-    echo "Merge complete."
 
     # Clean up the worktree (but NOT volumes — pool keeps them)
     if [[ -d "$worktree_path" ]]; then
@@ -820,7 +994,6 @@ cmd_pool_accept() {
         git -C "$project_path" worktree remove "$worktree_path" --force 2>/dev/null \
             || rm -rf "$worktree_path"
         rm -f "${worktree_path}.sandbox-meta"
-        # Delete the branch since it's merged
         git -C "$project_path" branch -d "$branch_name" 2>/dev/null || true
     fi
 
@@ -833,9 +1006,7 @@ cmd_pool_accept() {
     echo "Restarting pool sandbox '$session' for next task..."
     local provider_name
     provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-    export SANDBOX_WARM=true
-    cmd_start "$project" "$session" --provider "$provider_name" --dangerous
-    unset SANDBOX_WARM
+    ( cmd_start "$project" "$session" --warm --provider "$provider_name" --dangerous )
 
     echo ""
     echo "Pool sandbox '$session' is idle and ready for next task."
@@ -854,27 +1025,43 @@ cmd_pool_reject() {
         exit 1
     fi
 
-    local state
-    state=$(pool_read_state "$project" "$session")
-    if [[ "$state" != "reviewing" ]]; then
+    # Atomic state check under flock (M2 fix)
+    local pdir
+    pdir="$(pool_dir "$project")"
+    local state_file="$pdir/${session}.state"
+    local verified
+    verified=$(
+        flock -x 200
+        local state
+        state=$(cat "$state_file" 2>/dev/null)
+        if [[ "$state" == "reviewing" ]]; then
+            echo "rejecting" > "$state_file"
+            echo "yes"
+        fi
+    ) 200>"${state_file}.lock"
+
+    if [[ "$verified" != "yes" ]]; then
+        local state
+        state=$(pool_read_state "$project" "$session")
         echo "ERROR: Pool sandbox '$session' is in state '$state', not 'reviewing'." >&2
         exit 1
     fi
 
-    local pdir
-    pdir="$(pool_dir "$project")"
     local project_path="$SANDBOX_BASE_DIR/$project"
     local worktree_path
-    worktree_path="$(resolve_worktree "$project" "$session")"
+    worktree_path="$(resolve_worktree "$project" "$session")")
+    local comp_name
+    comp_name=$(compose_project_name "$project" "$session")
 
     local branch_name
     branch_name=$(cat "$pdir/${session}.branch" 2>/dev/null || echo "$session")
 
     echo "Rejecting pool sandbox '$session' (discarding branch: $branch_name)..."
 
+    # Kill watcher if still running
+    pool_kill_watcher "$project" "$session"
+
     # Stop container, restore git pointer
-    local comp_name
-    comp_name=$(compose_project_name "$project" "$session")
     if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
         cmd_stop "$project" "$session"
     fi
@@ -896,9 +1083,7 @@ cmd_pool_reject() {
     echo "Restarting pool sandbox '$session'..."
     local provider_name
     provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-    export SANDBOX_WARM=true
-    cmd_start "$project" "$session" --provider "$provider_name" --dangerous
-    unset SANDBOX_WARM
+    ( cmd_start "$project" "$session" --warm --provider "$provider_name" --dangerous )
 
     echo "Pool sandbox '$session' is idle and ready for next task."
 }
@@ -928,10 +1113,15 @@ cmd_pool_cancel() {
 
     echo "Cancelling agent in pool sandbox '$session'..."
 
+    # Kill watcher first so it doesn't race
+    pool_kill_watcher "$project" "$session"
+
     # Kill the agent process inside the container
-    local process_pattern="claude"
+    local process_pattern="[c]laude"
     if type provider_process_name &>/dev/null; then
-        process_pattern=$(provider_process_name)
+        local raw_pattern
+        raw_pattern=$(provider_process_name)
+        process_pattern="[${raw_pattern:0:1}]${raw_pattern:1}"
     fi
     docker exec "${comp_name}-agent" pkill -f "$process_pattern" 2>/dev/null || true
 
@@ -1016,7 +1206,6 @@ cmd_pool_stop() {
     if [[ "$has_reviewing" == "true" && "$force" != "true" ]]; then
         echo "WARNING: Pool has sandboxes with unmerged work."
         echo "Accept or reject them first, or use --force to discard."
-        # Read from tty for interactive prompt
         local tty_in=/dev/stdin
         [[ -t 0 ]] || { [[ -e /dev/tty ]] && tty_in=/dev/tty; }
         local confirm
@@ -1035,6 +1224,7 @@ cmd_pool_stop() {
         local session
         session=$(basename "${state_file%.state}")
         echo "  Stopping $session..."
+        pool_kill_watcher "$project" "$session"
         cmd_stop "$project" "$session" --clean 2>/dev/null || true
     done
 
@@ -1091,21 +1281,11 @@ git commit -m "feat: implement pool stop and pool list commands"
 ### Task 9: Wire Pool Commands into Main Dispatch
 
 **Files:**
-- Modify: `sandbox.sh:1561-1579` (the main case dispatch)
-- Modify: `sandbox.sh:100-148` (the usage function)
+- Modify: `sandbox.sh` (main case dispatch and usage function)
 
 - [ ] **Step 1: Add pool subcommand routing to the main case block**
 
-Find the main dispatch block:
-
-```bash
-case "$command" in
-    start)    cmd_start "$@" ;;
-    stop)     cmd_stop "$@" ;;
-    ...
-```
-
-Add `pool` before the error case:
+Find the main dispatch `case "$command" in` block. Add `pool)` before the error case:
 
 ```bash
     pool)
@@ -1131,7 +1311,7 @@ Add `pool` before the error case:
 
 - [ ] **Step 2: Update the usage function**
 
-Add pool commands to the usage text (inside the `cat <<'EOF'` block), after the `prune` entry:
+Add pool commands to the usage text after the `prune` entry:
 
 ```
   pool start <project> [--count N] [--profile <name>] [--provider <name>] [--dangerous]
@@ -1176,11 +1356,11 @@ git commit -m "feat: wire pool commands into main dispatch and usage"
 ### Task 10: Update `cmd_list` to Tag Pool Sandboxes
 
 **Files:**
-- Modify: `sandbox.sh:1029-1135` (the `cmd_list` function)
+- Modify: `sandbox.sh` (the `cmd_list` function)
 
 - [ ] **Step 1: Add [pool] tag to pool sandboxes in the list output**
 
-Find the line in `cmd_list` that prints the sandbox entry (around line 1066):
+Find the line in `cmd_list` that prints the sandbox entry:
 
 ```bash
                 echo "  [$idx] $project / $session"
@@ -1215,17 +1395,18 @@ git commit -m "feat: show [pool] tag in sandbox list for pool sandboxes"
 ### Task 11: Add `provider_process_name` Hook to Claude Code Provider
 
 **Files:**
-- Modify: `providers/claude-code/provider.sh:130-171` (optional hooks section)
+- Modify: `providers/claude-code/provider.sh` (optional hooks section)
 
 - [ ] **Step 1: Add provider_process_name hook**
 
-Insert after the `provider_headless` function (after line 171):
+Insert after the `provider_headless` function:
 
 ```bash
 # provider_process_name
 #
 # Returns the process name pattern used to detect when the agent is running.
 # Used by the pool completion watcher with pgrep -f.
+# The watcher applies the bracket trick automatically (claude -> [c]laude).
 #
 provider_process_name() {
     echo "claude"
@@ -1559,10 +1740,7 @@ git commit -m "feat: update sandbox-merge skill to delegate to pool accept for p
 ### Task 16: Copy Updated Skills to User Install Location
 
 **Files:**
-- Copy: `skills/sandbox-pool/SKILL.md` → `~/.claude/skills/sandbox-pool/SKILL.md`
-- Copy: `skills/sandbox-accept/SKILL.md` → `~/.claude/skills/sandbox-accept/SKILL.md`
-- Copy: `skills/sandbox-execute/SKILL.md` → `~/.claude/skills/sandbox-execute/SKILL.md`
-- Copy: `skills/sandbox-merge/SKILL.md` → `~/.claude/skills/sandbox-merge/SKILL.md`
+- Copy skills to `~/.claude/skills/`
 
 - [ ] **Step 1: Copy all skills to user install location**
 
@@ -1574,8 +1752,6 @@ cp skills/sandbox-execute/SKILL.md ~/.claude/skills/sandbox-execute/SKILL.md
 cp skills/sandbox-merge/SKILL.md ~/.claude/skills/sandbox-merge/SKILL.md
 ```
 
-- [ ] **Step 2: Commit the repo-side skills (already done in previous tasks — this is just the install step)**
-
 No git commit needed — this is a local install action.
 
 ---
@@ -1586,42 +1762,31 @@ No git commit needed — this is a local install action.
 - Modify: `CLAUDE.md`
 - Modify: `README.md`
 
-- [ ] **Step 1: Add pool commands to CLAUDE.md key files table**
+- [ ] **Step 1: Update sandbox.sh description in Key Files table**
 
-In `CLAUDE.md`, add to the Key Files table:
+```markdown
+| `sandbox.sh` | Main launcher (Bash). Commands: start, stop, list, logs, shell, headless, diff, repair, pool (start/stop/status/assign/accept/reject/cancel/list) |
+```
+
+- [ ] **Step 2: Add pool entries to Key Files table**
 
 ```markdown
 | `<project>/.pool/` | Pool state directory (gitignored) — state files per pool sandbox |
+| `skills/sandbox-pool/` | Pool lifecycle management skill |
+| `skills/sandbox-accept/` | Review and merge pool sandbox work |
 ```
 
-- [ ] **Step 2: Add pool section to CLAUDE.md naming conventions**
+- [ ] **Step 3: Add pool naming conventions**
 
 In the Naming Conventions section, add:
 
 ```markdown
 - Pool session names: `pool-1`, `pool-2`, etc.
 - Pool state dir: `$SANDBOX_BASE_DIR/<project>/.pool/`
-- Pool state files: `<session>.state`, `<session>.plan`, `<session>.branch`, `<session>.provider`
+- Pool state files: `<session>.state`, `<session>.plan`, `<session>.branch`, `<session>.provider`, `<session>.watcher-pid`
 ```
 
-- [ ] **Step 3: Add pool commands summary to CLAUDE.md**
-
-After the existing `sandbox.sh` description in the Key Files table, update:
-
-```markdown
-| `sandbox.sh` | Main launcher (Bash). Commands: start, stop, list, logs, shell, headless, diff, repair, pool (start/stop/status/assign/accept/reject/cancel/list) |
-```
-
-- [ ] **Step 4: Add pool skills to CLAUDE.md**
-
-In a skills section (or after the existing skills mention), add:
-
-```markdown
-| `skills/sandbox-pool/` | Pool lifecycle management skill |
-| `skills/sandbox-accept/` | Review and merge pool sandbox work |
-```
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add CLAUDE.md README.md
@@ -1637,7 +1802,7 @@ git commit -m "docs: add pool commands and skills to CLAUDE.md and README.md"
 - [ ] **Step 1: Start a pool**
 
 Run: `bash sandbox.sh pool start <test-project> --count 1`
-Expected: One sandbox starts, state file created at `<test-project>/.pool/pool-1.state` containing "idle"
+Expected: One sandbox starts, state file at `<test-project>/.pool/pool-1.state` containing "idle"
 
 - [ ] **Step 2: Check pool status**
 
@@ -1652,17 +1817,17 @@ Expected: pool-1 shows with `[pool:idle]` tag
 - [ ] **Step 4: Assign a plan**
 
 Run: `bash sandbox.sh pool assign <test-project> <path-to-test-plan>`
-Expected: Warm restart (~5-15 seconds), state changes to "busy"
+Expected: Warm restart (~5-15 seconds), state changes to "busy", watcher PID file created
 
 - [ ] **Step 5: Cancel and verify reviewing state**
 
 Run: `bash sandbox.sh pool cancel <test-project> pool-1`
-Expected: Agent killed, state changes to "reviewing"
+Expected: Agent killed, watcher killed, state changes to "reviewing"
 
 - [ ] **Step 6: Reject and verify idle state**
 
 Run: `bash sandbox.sh pool reject <test-project> pool-1`
-Expected: Worktree discarded, container restarted, state back to "idle"
+Expected: Worktree discarded, container restarted warm, state back to "idle"
 
 - [ ] **Step 7: Stop the pool**
 

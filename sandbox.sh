@@ -1984,6 +1984,308 @@ _pool_start_watcher() {
     done
 }
 
+cmd_pool_accept() {
+    local project="$1"
+    local session="$2"
+
+    if [[ -z "$project" || -z "$session" ]]; then
+        echo "ERROR: pool accept requires <project> <session>" >&2
+        exit 1
+    fi
+
+    # Atomic state check under flock
+    local pdir
+    pdir="$(pool_dir "$project")"
+    local state_file="$pdir/${session}.state"
+    local verified
+    verified=$(
+        flock -x 200
+        local state
+        state=$(cat "$state_file" 2>/dev/null)
+        if [[ "$state" == "reviewing" ]]; then
+            echo "accepting" > "$state_file"
+            echo "yes"
+        fi
+    ) 200>"${state_file}.lock"
+
+    if [[ "$verified" != "yes" ]]; then
+        local state
+        state=$(pool_read_state "$project" "$session")
+        echo "ERROR: Pool sandbox '$session' is in state '$state', not 'reviewing'." >&2
+        exit 1
+    fi
+
+    local project_path="$SANDBOX_BASE_DIR/$project"
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
+    local comp_name
+    comp_name=$(compose_project_name "$project" "$session")
+
+    local branch_name
+    branch_name=$(cat "$pdir/${session}.branch" 2>/dev/null || echo "$session")
+
+    echo "Merging pool sandbox '$session' (branch: $branch_name)..."
+
+    # Kill watcher if still running
+    pool_kill_watcher "$project" "$session"
+
+    # Stop container to restore git pointer for host-side merge
+    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+        cmd_stop "$project" "$session"
+    fi
+
+    # Use shared merge logic
+    if ! _do_merge "$project_path" "$worktree_path" "$branch_name"; then
+        echo ""
+        echo "Reconnect with: sandbox shell $project $session"
+        # Restart container so user can fix
+        local provider_name
+        provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
+        ( cmd_start "$project" "$session" --warm --branch "$branch_name" --provider "$provider_name" --dangerous )
+        pool_write_state "$project" "$session" "reviewing"
+        exit 1
+    fi
+
+    # Clean up the worktree (but NOT volumes — pool keeps them)
+    if [[ -d "$worktree_path" ]]; then
+        git -C "$project_path" config core.longpaths true
+        git -C "$project_path" worktree remove "$worktree_path" --force 2>/dev/null \
+            || rm -rf "$worktree_path"
+        rm -f "${worktree_path}.sandbox-meta"
+        git -C "$project_path" branch -d "$branch_name" 2>/dev/null || true
+    fi
+
+    # Clean up task metadata and set idle
+    rm -f "$pdir/${session}.plan" "$pdir/${session}.branch"
+    pool_write_state "$project" "$session" "idle"
+
+    # Restart the container so it's warm for next task
+    echo ""
+    echo "Restarting pool sandbox '$session' for next task..."
+    local provider_name
+    provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
+    ( cmd_start "$project" "$session" --warm --provider "$provider_name" --dangerous )
+
+    echo ""
+    echo "Pool sandbox '$session' is idle and ready for next task."
+}
+
+cmd_pool_reject() {
+    local project="$1"
+    local session="$2"
+
+    if [[ -z "$project" || -z "$session" ]]; then
+        echo "ERROR: pool reject requires <project> <session>" >&2
+        exit 1
+    fi
+
+    # Atomic state check under flock
+    local pdir
+    pdir="$(pool_dir "$project")"
+    local state_file="$pdir/${session}.state"
+    local verified
+    verified=$(
+        flock -x 200
+        local state
+        state=$(cat "$state_file" 2>/dev/null)
+        if [[ "$state" == "reviewing" ]]; then
+            echo "rejecting" > "$state_file"
+            echo "yes"
+        fi
+    ) 200>"${state_file}.lock"
+
+    if [[ "$verified" != "yes" ]]; then
+        local state
+        state=$(pool_read_state "$project" "$session")
+        echo "ERROR: Pool sandbox '$session' is in state '$state', not 'reviewing'." >&2
+        exit 1
+    fi
+
+    local project_path="$SANDBOX_BASE_DIR/$project"
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
+    local comp_name
+    comp_name=$(compose_project_name "$project" "$session")
+
+    local branch_name
+    branch_name=$(cat "$pdir/${session}.branch" 2>/dev/null || echo "$session")
+
+    echo "Rejecting pool sandbox '$session' (discarding branch: $branch_name)..."
+
+    # Kill watcher if still running
+    pool_kill_watcher "$project" "$session"
+
+    # Stop container, restore git pointer
+    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+        cmd_stop "$project" "$session"
+    fi
+
+    # Remove worktree and branch
+    if [[ -d "$worktree_path" ]]; then
+        git -C "$project_path" config core.longpaths true
+        git -C "$project_path" worktree remove "$worktree_path" --force 2>/dev/null \
+            || rm -rf "$worktree_path"
+        rm -f "${worktree_path}.sandbox-meta"
+        git -C "$project_path" branch -D "$branch_name" 2>/dev/null || true
+    fi
+
+    # Clean up task metadata and set idle
+    rm -f "$pdir/${session}.plan" "$pdir/${session}.branch"
+    pool_write_state "$project" "$session" "idle"
+
+    # Restart the container
+    echo "Restarting pool sandbox '$session'..."
+    local provider_name
+    provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
+    ( cmd_start "$project" "$session" --warm --provider "$provider_name" --dangerous )
+
+    echo "Pool sandbox '$session' is idle and ready for next task."
+}
+
+cmd_pool_cancel() {
+    local project="$1"
+    local session="$2"
+
+    if [[ -z "$project" || -z "$session" ]]; then
+        echo "ERROR: pool cancel requires <project> <session>" >&2
+        exit 1
+    fi
+
+    local state
+    state=$(pool_read_state "$project" "$session")
+    if [[ "$state" != "busy" ]]; then
+        echo "ERROR: Pool sandbox '$session' is in state '$state', not 'busy'." >&2
+        exit 1
+    fi
+
+    local comp_name
+    comp_name=$(compose_project_name "$project" "$session")
+
+    echo "Cancelling agent in pool sandbox '$session'..."
+
+    # Kill watcher first so it doesn't race
+    pool_kill_watcher "$project" "$session"
+
+    # Kill the agent process inside the container
+    local process_pattern="[c]laude"
+    if type provider_process_name &>/dev/null; then
+        local raw_pattern
+        raw_pattern=$(provider_process_name)
+        process_pattern="[${raw_pattern:0:1}]${raw_pattern:1}"
+    fi
+    docker exec "${comp_name}-agent" pkill -f "$process_pattern" 2>/dev/null || true
+
+    pool_write_state "$project" "$session" "reviewing"
+
+    echo "Agent stopped. Sandbox '$session' is now in 'reviewing' state."
+    echo "Partial work may be available."
+    echo ""
+    echo "  Accept:  sandbox pool accept $project $session"
+    echo "  Reject:  sandbox pool reject $project $session"
+    echo "  Diff:    sandbox diff $project $session"
+}
+
+cmd_pool_stop() {
+    local project=""
+    local force=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            *)
+                if [[ -z "$project" ]]; then
+                    project="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$project" ]]; then
+        echo "ERROR: pool stop requires <project>" >&2
+        exit 1
+    fi
+
+    local pdir
+    pdir="$(pool_dir "$project")"
+
+    if [[ ! -d "$pdir" ]]; then
+        echo "No pool found for '$project'."
+        return
+    fi
+
+    # Check for busy/reviewing sandboxes
+    local has_busy=false
+    local has_reviewing=false
+    for state_file in "$pdir"/pool-*.state; do
+        [[ -f "$state_file" ]] || continue
+        local state
+        state=$(cat "$state_file")
+        [[ "$state" == "busy" ]] && has_busy=true
+        [[ "$state" == "reviewing" ]] && has_reviewing=true
+    done
+
+    if [[ "$has_busy" == "true" && "$force" != "true" ]]; then
+        echo "ERROR: Pool has busy sandboxes. Use --force to stop anyway." >&2
+        exit 1
+    fi
+
+    if [[ "$has_reviewing" == "true" && "$force" != "true" ]]; then
+        echo "WARNING: Pool has sandboxes with unmerged work."
+        echo "Accept or reject them first, or use --force to discard."
+        local tty_in=/dev/stdin
+        [[ -t 0 ]] || { [[ -e /dev/tty ]] && tty_in=/dev/tty; }
+        local confirm
+        read -rp "Stop anyway? [y/N] " confirm < "$tty_in"
+        if [[ "$confirm" != [yY] ]]; then
+            echo "Aborted."
+            return
+        fi
+    fi
+
+    echo "Stopping pool for '$project'..."
+    echo ""
+
+    for state_file in "$pdir"/pool-*.state; do
+        [[ -f "$state_file" ]] || continue
+        local session
+        session=$(basename "${state_file%.state}")
+        echo "  Stopping $session..."
+        pool_kill_watcher "$project" "$session"
+        cmd_stop "$project" "$session" --clean 2>/dev/null || true
+    done
+
+    # Remove pool directory
+    rm -rf "$pdir"
+
+    echo ""
+    echo "Pool stopped and cleaned up for '$project'."
+}
+
+cmd_pool_list() {
+    local found=false
+    for pdir in "$SANDBOX_BASE_DIR"/*/.pool; do
+        [[ -d "$pdir" ]] || continue
+        found=true
+        local project
+        project=$(basename "$(dirname "$pdir")")
+        echo "Pool: $project"
+        for state_file in "$pdir"/pool-*.state; do
+            [[ -f "$state_file" ]] || continue
+            local session
+            session=$(basename "${state_file%.state}")
+            local state
+            state=$(cat "$state_file")
+            printf "  %-12s  %s\n" "$session" "$state"
+        done
+        echo ""
+    done
+
+    if [[ "$found" == "false" ]]; then
+        echo "No active pools found."
+    fi
+}
+
 # --- Main ---
 
 if [[ $# -eq 0 ]]; then

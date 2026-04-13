@@ -1322,19 +1322,36 @@ cmd_merge() {
     # creating lockfiles, Gradle build output) that are not real agent work.
     echo "Cleaning sandbox artifacts..."
 
-    # Reset line-ending-only changes on scripts (dos2unix ran at startup)
+    # Reset modified tracked files that are sandbox artifacts (line-ending changes,
+    # generated files from builds, lockfiles modified by dependency installs)
+    local artifact_patterns=(
+        '*.sh' 'gradlew' 'gradlew.bat'           # dos2unix line-ending changes
+        'openapi.json' '*/openapi.json'           # generated API specs from builds
+        'package-lock.json' '*/package-lock.json'  # npm install side-effects
+        'pnpm-lock.yaml' '*/pnpm-lock.yaml'       # pnpm install side-effects
+        'yarn.lock' '*/yarn.lock'                  # yarn install side-effects
+    )
     git -C "$worktree_path" diff --name-only 2>/dev/null | while IFS= read -r f; do
-        # If the only difference is line endings (CR/LF), reset the file
+        local is_artifact=false
+        # Check line-ending-only changes
         if git -C "$worktree_path" diff --ignore-cr-at-eol --quiet -- "$f" 2>/dev/null; then
+            is_artifact=true
+        fi
+        # Check known artifact patterns
+        for pat in "${artifact_patterns[@]}"; do
+            # shellcheck disable=SC2254
+            case "$f" in $pat) is_artifact=true ;; esac
+        done
+        if [[ "$is_artifact" == "true" ]]; then
             git -C "$worktree_path" checkout -- "$f" 2>/dev/null
         fi
     done
 
     # Remove untracked build artifacts that the sandbox created
-    git -C "$worktree_path" clean -fdq \
-        -- '**/build/' '**/.gradle/' '**/node_modules/' \
-        'package-lock.json' '**/package-lock.json' \
-        2>/dev/null || true
+    find "$worktree_path" -maxdepth 3 -type d \( -name 'build' -o -name '.gradle' \) \
+        -exec rm -rf {} + 2>/dev/null || true
+    find "$worktree_path" -maxdepth 2 -name 'package-lock.json' -newer "$worktree_path/.git" \
+        -exec rm -f {} + 2>/dev/null || true
 
     # Check for uncommitted changes in the worktree (the agent may not have committed)
     local uncommitted

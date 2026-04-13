@@ -35,6 +35,28 @@ Use this priority order:
 
 ### 2. Pre-Merge Validation
 
+**Pool sandbox check:** Before proceeding with the standard merge, check if this session belongs to a pool:
+
+```bash
+# Check if .pool/<session>.state exists for the project
+ls "$SANDBOX_BASE_DIR/<project>/.pool/<session>.state" 2>/dev/null
+```
+
+If the session is a pool sandbox, delegate to pool accept instead:
+
+```bash
+bash "$AGENT_SANDBOX_HOME/sandbox.sh" pool accept <project> <session>
+```
+
+Report:
+```
+Pool sandbox merged! Sandbox is idle for next task.
+```
+
+**Stop here** — do not proceed to the standard merge/cleanup steps (the pool accept command handles everything and keeps the container warm).
+
+If not a pool sandbox, proceed with the standard merge flow below.
+
 Before merging, the `sandbox.sh merge` command validates that work was actually committed. It will **abort with an error** if:
 
 - **Uncommitted changes exist** in the worktree — the agent may not have finished. The error will suggest `sandbox shell` to reconnect or `sandbox diff` to review.

@@ -40,7 +40,51 @@ Run `git status -- docs/superpowers/plans/<plan-file>` using the Bash tool. If t
 
 If `git status` shows the file is clean (committed and unmodified), proceed.
 
-### 4. Derive Session Name and Launch
+### 4. Check for Pool Sandbox
+
+Unless the user passed `--fresh`, check if the project has an active pool:
+
+```bash
+bash "$AGENT_SANDBOX_HOME/sandbox.sh" pool status <project> 2>/dev/null
+```
+
+If pool status returns sandboxes (the `.pool/` directory exists for the project):
+
+1. **If an idle sandbox is found** — use the pool path. Run:
+   ```bash
+   bash "$AGENT_SANDBOX_HOME/sandbox.sh" pool assign <project> <plan-file-path>
+   ```
+
+   Report to user:
+   ```
+   Assigned to pool sandbox!
+
+     Project:  <project>
+     Sandbox:  <session>
+     Plan:     <plan-file>
+     Branch:   <branch>
+
+   The sandbox is working. Check progress:
+     /sandbox-pool status
+   
+   When done:
+     /sandbox-accept
+   ```
+
+   **Stop here** — do not proceed to Step 5 (the cold-start path).
+
+2. **If no idle sandbox is available** — tell the user:
+   ```
+   All pool sandboxes are busy. Options:
+     - Wait for one to finish (check /sandbox-pool status)
+     - Force a fresh ephemeral sandbox: /sandbox-execute --fresh <plan-file>
+   ```
+   
+   **Stop here** unless the user chooses `--fresh`.
+
+If no pool exists or `--fresh` was passed, proceed to Step 5 (original cold-start behavior).
+
+### 5. Derive Session Name and Launch
 
 Derive the session name by stripping the date prefix (`YYYY-MM-DD-`) and `.md` extension from the plan filename. For example: `2026-04-01-feature-name.md` becomes `feature-name`.
 
@@ -77,7 +121,7 @@ docker exec -u root sandbox-<project>-<session>-agent chmod +x /home/agent/sandb
 docker exec -it sandbox-<project>-<session>-agent /home/agent/sandbox-start-agent.sh
 ```
 
-### 5. Report to User
+### 6. Report to User
 
 Print immediately after launching the window (don't wait for the sandbox to finish starting):
 

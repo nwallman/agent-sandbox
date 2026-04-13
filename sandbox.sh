@@ -1639,6 +1639,176 @@ cmd_update() {
     echo "Running sandboxes will use old images until restarted."
 }
 
+# --- Pool commands ---
+
+cmd_pool_start() {
+    local project=""
+    local count=1
+    local profile=""
+    local provider=""
+    local dangerous=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --count) count="$2"; shift 2 ;;
+            --profile) profile="$2"; shift 2 ;;
+            --provider) provider="$2"; shift 2 ;;
+            --dangerous) dangerous=true; shift ;;
+            *)
+                if [[ -z "$project" ]]; then
+                    project="$1"
+                else
+                    echo "ERROR: Unexpected argument: $1" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$project" ]]; then
+        echo "ERROR: pool start requires <project>" >&2
+        exit 1
+    fi
+
+    local project_path="$SANDBOX_BASE_DIR/$project"
+    if [[ ! -d "$project_path" ]]; then
+        echo "ERROR: Project directory not found: $project_path" >&2
+        exit 1
+    fi
+
+    # Create pool directory and gitignore it
+    local pdir
+    pdir="$(pool_dir "$project")"
+    mkdir -p "$pdir"
+    if ! grep -qxF '/.pool' "$project_path/.gitignore" 2>/dev/null; then
+        echo '/.pool' >> "$project_path/.gitignore"
+    fi
+
+    echo "Starting pool for '$project' with $count sandbox(es)..."
+    echo ""
+
+    local start_args=()
+    [[ -n "$profile" ]] && start_args+=(--profile "$profile")
+    [[ -n "$provider" ]] && start_args+=(--provider "$provider")
+    [[ "$dangerous" == "true" ]] && start_args+=(--dangerous)
+
+    for i in $(seq 1 "$count"); do
+        local session="pool-${i}"
+
+        # Check if this pool sandbox already exists
+        if [[ -f "$pdir/${session}.state" ]]; then
+            local existing_state
+            existing_state=$(pool_read_state "$project" "$session")
+            echo "  Pool sandbox '$session' already exists (state: $existing_state)"
+
+            # If container is down, restart it
+            local comp_name
+            comp_name=$(compose_project_name "$project" "$session")
+            if ! docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+                echo "  Restarting container for '$session'..."
+                ( cmd_start "$project" "$session" "${start_args[@]}" )
+                pool_write_state "$project" "$session" "idle"
+            fi
+            continue
+        fi
+
+        echo "  Starting pool sandbox: $session"
+        ( cmd_start "$project" "$session" "${start_args[@]}" )
+
+        # Write initial pool state
+        pool_write_state "$project" "$session" "idle"
+
+        # Record provider for later reconnection
+        local used_provider="${provider:-$SANDBOX_PROVIDER}"
+        echo "$used_provider" > "$pdir/${session}.provider"
+
+        echo "  Pool sandbox '$session' is idle and ready."
+        echo ""
+    done
+
+    echo "Pool ready. $count sandbox(es) idle for '$project'."
+    echo ""
+    echo "  Assign work:  sandbox pool assign $project <plan-file>"
+    echo "  Check status:  sandbox pool status $project"
+}
+
+cmd_pool_status() {
+    local project="$1"
+
+    if [[ -z "$project" ]]; then
+        echo "ERROR: pool status requires <project>" >&2
+        exit 1
+    fi
+
+    local pdir
+    pdir="$(pool_dir "$project")"
+
+    if [[ ! -d "$pdir" ]]; then
+        echo "No pool found for '$project'."
+        return
+    fi
+
+    echo "Pool status for '$project':"
+    echo ""
+
+    local total=0
+    local idle_count=0
+    local busy_count=0
+    local reviewing_count=0
+
+    for state_file in "$pdir"/pool-*.state; do
+        [[ -f "$state_file" ]] || continue
+        local session
+        session=$(basename "${state_file%.state}")
+        local state
+        state=$(cat "$state_file")
+        total=$((total + 1))
+
+        local comp_name
+        comp_name=$(compose_project_name "$project" "$session")
+        local container_status="unknown"
+        if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+            container_status="running"
+        else
+            container_status="stopped"
+        fi
+
+        # Cross-reference: state says busy but container is down
+        local flag=""
+        if [[ "$container_status" == "stopped" && "$state" == "busy" ]]; then
+            state="failed"
+            pool_write_state "$project" "$session" "failed"
+            flag=" (was busy, container died)"
+        elif [[ "$container_status" == "stopped" && "$state" == "idle" ]]; then
+            flag=" (container not running)"
+        fi
+
+        printf "  %-12s  state=%-10s  container=%-8s" "$session" "$state" "$container_status"
+
+        case "$state" in
+            idle) idle_count=$((idle_count + 1)) ;;
+            busy) busy_count=$((busy_count + 1)) ;;
+            reviewing) reviewing_count=$((reviewing_count + 1)) ;;
+        esac
+
+        # Show branch and plan if busy or reviewing
+        if [[ "$state" == "busy" || "$state" == "reviewing" ]]; then
+            local branch=""
+            local plan=""
+            [[ -f "$pdir/${session}.branch" ]] && branch=$(cat "$pdir/${session}.branch")
+            [[ -f "$pdir/${session}.plan" ]] && plan=$(cat "$pdir/${session}.plan")
+            [[ -n "$branch" ]] && printf "  branch=%s" "$branch"
+            [[ -n "$plan" ]] && printf "  plan=%s" "$(basename "$plan")"
+        fi
+
+        echo "$flag"
+    done
+
+    echo ""
+    echo "  Total: $total  Idle: $idle_count  Busy: $busy_count  Reviewing: $reviewing_count"
+}
+
 # --- Main ---
 
 if [[ $# -eq 0 ]]; then

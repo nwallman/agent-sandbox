@@ -466,6 +466,7 @@ cmd_start() {
     local read_only=false
     local open_network=false
     local docker=false
+    local warm=false
     local extra_env=()
 
     # Parse args
@@ -479,6 +480,7 @@ cmd_start() {
             --read-only) read_only=true; shift ;;
             --open-network) open_network=true; shift ;;
             --docker) docker=true; shift ;;
+            --warm) warm=true; shift ;;
             *)
                 if [[ -z "$project" ]]; then
                     project="$1"
@@ -546,26 +548,31 @@ cmd_start() {
     load_provider "$provider"
 
     # Create or reuse git worktree for session isolation
-    local wt_dir
-    wt_dir="$(worktree_dir "$project")"
-    mkdir -p "$wt_dir"
-    # Ensure .worktrees is gitignored in the project
-    if ! grep -qxF '/.worktrees' "$project_path/.gitignore" 2>/dev/null; then
-        echo '/.worktrees' >> "$project_path/.gitignore"
-    fi
-    local worktree_path="$wt_dir/${project}--${session}"
-    if [[ -d "$worktree_path" ]]; then
-        if [[ "$branch" != "$session" ]]; then
-            echo "WARNING: --branch ignored; worktree already exists at $worktree_path"
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
+
+    if [[ "$warm" == "false" ]]; then
+        local wt_dir
+        wt_dir="$(worktree_dir "$project")"
+        mkdir -p "$wt_dir"
+        # Ensure .worktrees is gitignored in the project
+        if ! grep -qxF '/.worktrees' "$project_path/.gitignore" 2>/dev/null; then
+            echo '/.worktrees' >> "$project_path/.gitignore"
         fi
-        echo "Reusing existing worktree: $worktree_path"
-    else
-        echo "Creating worktree: $worktree_path (branch: $branch)"
-        # Create branch from current HEAD if it doesn't exist
-        if ! git -C "$project_path" rev-parse --verify "$branch" &>/dev/null; then
-            git -C "$project_path" branch "$branch"
+        worktree_path="$wt_dir/${project}--${session}"
+        if [[ -d "$worktree_path" ]]; then
+            if [[ "$branch" != "$session" ]]; then
+                echo "WARNING: --branch ignored; worktree already exists at $worktree_path"
+            fi
+            echo "Reusing existing worktree: $worktree_path"
+        else
+            echo "Creating worktree: $worktree_path (branch: $branch)"
+            # Create branch from current HEAD if it doesn't exist
+            if ! git -C "$project_path" rev-parse --verify "$branch" &>/dev/null; then
+                git -C "$project_path" branch "$branch"
+            fi
+            git -C "$project_path" worktree add "$worktree_path" "$branch"
         fi
-        git -C "$project_path" worktree add "$worktree_path" "$branch"
     fi
 
     # Store branch name and provider for cleanup and reconnection
@@ -579,52 +586,57 @@ cmd_start() {
     local comp_name
     comp_name=$(compose_project_name "$project" "$session")
 
-    # Check if already running
-    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
-        echo "Sandbox '$comp_name' is already running."
-        echo "Use 'sandbox shell $project $session' to connect."
-        exit 0
-    fi
-
-    # Build base image if needed
-    local image_tag="agent-sandbox:${profile}"
-    if ! docker image inspect "$image_tag" &>/dev/null; then
-        echo "Building image: $image_tag ..."
-        if [[ "$profile" == "base" ]]; then
-            docker build -f "$SCRIPT_DIR/images/base/Dockerfile" \
-                -t "$image_tag" "$SCRIPT_DIR/images/base"
-        else
-            # Build base first if needed
-            if ! docker image inspect "agent-sandbox:base" &>/dev/null; then
-                docker build -f "$SCRIPT_DIR/images/base/Dockerfile" \
-                    -t "agent-sandbox:base" "$SCRIPT_DIR/images/base"
-            fi
-            docker build -f "$SCRIPT_DIR/images/profiles/${profile}.Dockerfile" \
-                -t "$image_tag" "$SCRIPT_DIR/images/profiles"
+    # Check if already running (skip when --warm; pool restarts expect re-entry)
+    if [[ "$warm" == "false" ]]; then
+        if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+            echo "Sandbox '$comp_name' is already running."
+            echo "Use 'sandbox shell $project $session' to connect."
+            exit 0
         fi
     fi
 
-    # Build provider layer on top of profile image
-    local final_tag="agent-sandbox:${profile}"
-    local provider_dockerfile
-    provider_dockerfile=$(mktemp)
-    _tmpfiles+=("$provider_dockerfile")
-    echo "FROM agent-sandbox:${profile}" > "$provider_dockerfile"
-    provider_setup "$image_tag" >> "$provider_dockerfile"
-    docker build -f "$provider_dockerfile" \
-        ${AGENT_VERSION:+--build-arg AGENT_VERSION="$AGENT_VERSION"} \
-        -t "$final_tag" "$SCRIPT_DIR"
+    # Build images (skip when --warm; images are already built on cold start)
+    if [[ "$warm" == "false" ]]; then
+        # Build base image if needed
+        local image_tag="agent-sandbox:${profile}"
+        if ! docker image inspect "$image_tag" &>/dev/null; then
+            echo "Building image: $image_tag ..."
+            if [[ "$profile" == "base" ]]; then
+                docker build -f "$SCRIPT_DIR/images/base/Dockerfile" \
+                    -t "$image_tag" "$SCRIPT_DIR/images/base"
+            else
+                # Build base first if needed
+                if ! docker image inspect "agent-sandbox:base" &>/dev/null; then
+                    docker build -f "$SCRIPT_DIR/images/base/Dockerfile" \
+                        -t "agent-sandbox:base" "$SCRIPT_DIR/images/base"
+                fi
+                docker build -f "$SCRIPT_DIR/images/profiles/${profile}.Dockerfile" \
+                    -t "$image_tag" "$SCRIPT_DIR/images/profiles"
+            fi
+        fi
 
-    # Build proxy image if needed
-    if [[ "$open_network" == "false" ]] && ! docker image inspect "agent-sandbox:proxy" &>/dev/null; then
-        echo "Building image: agent-sandbox:proxy ..."
-        docker build -f "$SCRIPT_DIR/images/proxy/Dockerfile" -t "agent-sandbox:proxy" "$SCRIPT_DIR/images/proxy"
-    fi
+        # Build provider layer on top of profile image
+        local final_tag="agent-sandbox:${profile}"
+        local provider_dockerfile
+        provider_dockerfile=$(mktemp)
+        _tmpfiles+=("$provider_dockerfile")
+        echo "FROM agent-sandbox:${profile}" > "$provider_dockerfile"
+        provider_setup "$image_tag" >> "$provider_dockerfile"
+        docker build -f "$provider_dockerfile" \
+            ${AGENT_VERSION:+--build-arg AGENT_VERSION="$AGENT_VERSION"} \
+            -t "$final_tag" "$SCRIPT_DIR"
 
-    # Build dind image if needed
-    if [[ "$docker" == "true" ]] && ! docker image inspect "agent-sandbox:dind" &>/dev/null; then
-        echo "Building image: agent-sandbox:dind ..."
-        docker build -f "$SCRIPT_DIR/images/dind/Dockerfile" -t "agent-sandbox:dind" "$SCRIPT_DIR/images/dind"
+        # Build proxy image if needed
+        if [[ "$open_network" == "false" ]] && ! docker image inspect "agent-sandbox:proxy" &>/dev/null; then
+            echo "Building image: agent-sandbox:proxy ..."
+            docker build -f "$SCRIPT_DIR/images/proxy/Dockerfile" -t "agent-sandbox:proxy" "$SCRIPT_DIR/images/proxy"
+        fi
+
+        # Build dind image if needed
+        if [[ "$docker" == "true" ]] && ! docker image inspect "agent-sandbox:dind" &>/dev/null; then
+            echo "Building image: agent-sandbox:dind ..."
+            docker build -f "$SCRIPT_DIR/images/dind/Dockerfile" -t "agent-sandbox:dind" "$SCRIPT_DIR/images/dind"
+        fi
     fi
 
     # Port allocation
@@ -843,40 +855,44 @@ NODEEOF
     fi
     docker compose -p "$comp_name" "${compose_files[@]}" "${compose_up_args[@]}" up -d
 
-    # Fix ownership on session-local volumes (created as root by Docker)
-    if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
+    # Fix ownership on session-local volumes (skip when --warm; already done on cold start)
+    if [[ "$warm" == "false" ]]; then
+        if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
+            docker exec -u root "${comp_name}-agent" bash -c \
+                "chown agent:agent /home/agent/.gradle /build-output || true"
+        fi
+        # Fix ownership on node_modules volumes (created as root by Docker)
         docker exec -u root "${comp_name}-agent" bash -c \
-            "chown agent:agent /home/agent/.gradle /build-output || true"
+            'for d in /workspace/node_modules /workspace/*/node_modules; do [ -d "$d" ] && chown agent:agent "$d"; done' 2>/dev/null || true
     fi
-    # Fix ownership on node_modules volumes (created as root by Docker)
-    docker exec -u root "${comp_name}-agent" bash -c \
-        'for d in /workspace/node_modules /workspace/*/node_modules; do [ -d "$d" ] && chown agent:agent "$d"; done' 2>/dev/null || true
 
-    # Provider-specific post-start initialization
+    # Provider-specific post-start initialization (always runs — refreshes auth, etc.)
     provider_start "${comp_name}-agent" "$dangerous"
 
-    if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
-        # Seed Gradle cache from host (first start only)
-        # Only copy dependency jars (modules-*) and wrapper — NOT transforms, groovy-dsl,
-        # or version-specific immutable workspaces, which contain platform-specific metadata
-        # that causes "immutable workspace does not contain metadata" errors on Linux.
-        docker exec "${comp_name}-agent" bash -c '
-            if [ -d /home/agent/.gradle-host/caches ] && [ ! -d /home/agent/.gradle/caches ]; then
-                echo "  Seeding Gradle cache from host..."
-                mkdir -p /home/agent/.gradle/caches
-                for d in /home/agent/.gradle-host/caches/modules-*; do
-                    [ -d "$d" ] && cp -a "$d" /home/agent/.gradle/caches/ 2>/dev/null || true
-                done
-                cp -a /home/agent/.gradle-host/wrapper /home/agent/.gradle/wrapper 2>/dev/null || true
-                echo "  Gradle cache seeded."
-            fi
-        '
+    # Expensive post-launch init (skip when --warm; already done on cold start)
+    if [[ "$warm" == "false" ]]; then
+        if [[ "$profile" == "java" || "$profile" == "fullstack" ]]; then
+            # Seed Gradle cache from host (first start only)
+            # Only copy dependency jars (modules-*) and wrapper — NOT transforms, groovy-dsl,
+            # or version-specific immutable workspaces, which contain platform-specific metadata
+            # that causes "immutable workspace does not contain metadata" errors on Linux.
+            docker exec "${comp_name}-agent" bash -c '
+                if [ -d /home/agent/.gradle-host/caches ] && [ ! -d /home/agent/.gradle/caches ]; then
+                    echo "  Seeding Gradle cache from host..."
+                    mkdir -p /home/agent/.gradle/caches
+                    for d in /home/agent/.gradle-host/caches/modules-*; do
+                        [ -d "$d" ] && cp -a "$d" /home/agent/.gradle/caches/ 2>/dev/null || true
+                    done
+                    cp -a /home/agent/.gradle-host/wrapper /home/agent/.gradle/wrapper 2>/dev/null || true
+                    echo "  Gradle cache seeded."
+                fi
+            '
 
-        # Gradle performance tuning (persists across sessions via gradle-cache volume)
-        docker exec "${comp_name}-agent" bash -c '
-            props="$HOME/.gradle/gradle.properties"
-            if [ ! -f "$props" ]; then
-                cat > "$props" << "GRADLE_EOF"
+            # Gradle performance tuning (persists across sessions via gradle-cache volume)
+            docker exec "${comp_name}-agent" bash -c '
+                props="$HOME/.gradle/gradle.properties"
+                if [ ! -f "$props" ]; then
+                    cat > "$props" << "GRADLE_EOF"
 # Sandbox Gradle performance tuning
 org.gradle.daemon=true
 org.gradle.daemon.idletimeout=1800000
@@ -887,32 +903,33 @@ org.gradle.configuration-cache=true
 org.gradle.configuration-cache.problems=warn
 org.gradle.workers.max=4
 GRADLE_EOF
-            fi
-        '
+                fi
+            '
+        fi
+
+        # Enable Testcontainers reusable containers when Docker is enabled
+        if [[ "$docker" == "true" ]]; then
+            docker exec "${comp_name}-agent" bash -c \
+                "echo 'testcontainers.reuse.enable=true' > /home/agent/.testcontainers.properties"
+        fi
+
+        # Auto-install Playwright browsers if the project depends on Playwright (node/fullstack only)
+        if [[ "$profile" == "node" || "$profile" == "fullstack" ]]; then
+            docker exec "${comp_name}-agent" bash -c '
+                if grep -rq "@playwright" /workspace/packages/*/package.json /workspace/package.json 2>/dev/null; then
+                    echo "  Installing Playwright browsers and system dependencies..."
+                    sudo npx playwright install-deps chromium 2>&1 | tail -3
+                    npx playwright install chromium 2>&1 | tail -1
+                fi
+            ' || true
+        fi
+
+        # Fix CRLF line endings on shell scripts (Windows host -> Linux container)
+        docker exec -u root "${comp_name}-agent" bash -c \
+            "find /workspace -maxdepth 4 -type f \( -name '*.sh' -o -name 'gradlew' \) -exec dos2unix -q {} + 2>/dev/null" || true
     fi
 
-    # Enable Testcontainers reusable containers when Docker is enabled
-    if [[ "$docker" == "true" ]]; then
-        docker exec "${comp_name}-agent" bash -c \
-            "echo 'testcontainers.reuse.enable=true' > /home/agent/.testcontainers.properties"
-    fi
-
-    # Auto-install Playwright browsers if the project depends on Playwright (node/fullstack only)
-    if [[ "$profile" == "node" || "$profile" == "fullstack" ]]; then
-        docker exec "${comp_name}-agent" bash -c '
-            if grep -rq "@playwright" /workspace/packages/*/package.json /workspace/package.json 2>/dev/null; then
-                echo "  Installing Playwright browsers and system dependencies..."
-                sudo npx playwright install-deps chromium 2>&1 | tail -3
-                npx playwright install chromium 2>&1 | tail -1
-            fi
-        ' || true
-    fi
-
-    # Fix CRLF line endings on shell scripts (Windows host -> Linux container)
-    docker exec -u root "${comp_name}-agent" bash -c \
-        "find /workspace -maxdepth 4 -type f \( -name '*.sh' -o -name 'gradlew' \) -exec dos2unix -q {} + 2>/dev/null" || true
-
-    # Fix git worktree pointer inside container (host Windows paths don't resolve in Linux)
+    # Fix git worktree pointer inside container (always runs — needed after bind mount change)
     # The .git file in the worktree points to the main repo's .git directory using host paths.
     # We overwrite it with container-compatible paths. This means host-side git on the worktree
     # won't work while the container is running, but that's expected — use the container.
@@ -921,7 +938,7 @@ GRADLE_EOF
     docker exec "${comp_name}-agent" bash -c \
         "echo 'gitdir: /project-git/worktrees/$worktree_name' > /workspace/.git"
 
-    # Seed .env in worktree from project's .env (LOCAL_ prefixed vars only)
+    # Seed .env in worktree from project's .env (always runs — worktree may be fresh)
     # Gitignored files don't exist in worktrees, and we don't want secrets in sandboxes.
     # Only LOCAL_ vars are safe for sandbox use (e.g., LOCAL_AUTH=true, LOCAL_DB_URL=...).
     for env_src in "$project_path"/.env "$project_path"/*/.env; do
@@ -951,8 +968,8 @@ GRADLE_EOF
         fi
     done
 
-    # Auto-install dependencies if missing (speeds up session start)
-    if [[ "$read_only" == "false" ]]; then
+    # Auto-install dependencies if missing (skip when --warm; already installed on cold start)
+    if [[ "$warm" == "false" && "$read_only" == "false" ]]; then
         # npm install in any directory with package.json but no node_modules
         # node_modules dirs are Docker volume overlays (fast Linux-native I/O)
         docker exec "${comp_name}-agent" bash -c '
@@ -1013,7 +1030,7 @@ GRADLE_EOF
         wait $npm_pid 2>/dev/null || true
     fi
 
-    log_event "START" "project=$project session=$session provider=$provider profile=$profile branch=$branch dangerous=$dangerous read_only=$read_only open_network=$open_network docker=$docker"
+    log_event "START" "project=$project session=$session provider=$provider profile=$profile branch=$branch dangerous=$dangerous read_only=$read_only open_network=$open_network docker=$docker warm=$warm"
 
     echo ""
     echo "Sandbox '$comp_name' is running."

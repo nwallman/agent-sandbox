@@ -235,6 +235,82 @@ validate_branch_name() {
     fi
 }
 
+# --- Pool state helpers ---
+
+# Pool directory for a project
+# Usage: pool_dir <project>
+pool_dir() {
+    echo "$SANDBOX_BASE_DIR/$1/.pool"
+}
+
+# Read a pool sandbox state file safely
+# Usage: pool_read_state <project> <session>
+# Returns: idle | busy | reviewing | failed (or empty if missing)
+pool_read_state() {
+    local state_file="$(pool_dir "$1")/$2.state"
+    [[ -f "$state_file" ]] && cat "$state_file" || echo ""
+}
+
+# Write a pool sandbox state file with flock for concurrency safety
+# Usage: pool_write_state <project> <session> <state>
+pool_write_state() {
+    local state_file="$(pool_dir "$1")/$2.state"
+    (
+        flock -x 200
+        echo "$3" > "$state_file"
+    ) 200>"${state_file}.lock"
+}
+
+# Atomically find and claim the first idle pool sandbox by writing "busy" under flock.
+# Usage: pool_claim_idle <project>
+# Returns: session name (or empty if none idle)
+# Side effect: sets claimed sandbox state to "busy"
+pool_claim_idle() {
+    local pdir
+    pdir="$(pool_dir "$1")"
+    [[ -d "$pdir" ]] || return 0
+    for state_file in "$pdir"/pool-*.state; do
+        [[ -f "$state_file" ]] || continue
+        local session
+        session=$(basename "${state_file%.state}")
+        # Atomic read-and-claim under exclusive flock
+        local claimed
+        claimed=$(
+            flock -x 200
+            local state
+            state=$(cat "$state_file" 2>/dev/null)
+            if [[ "$state" == "idle" ]]; then
+                echo "busy" > "$state_file"
+                echo "$session"
+            fi
+        ) 200>"${state_file}.lock"
+        if [[ -n "$claimed" ]]; then
+            echo "$claimed"
+            return 0
+        fi
+    done
+}
+
+# Check if a session belongs to a pool
+# Usage: is_pool_sandbox <project> <session>
+# Returns: 0 if pool sandbox, 1 if not
+is_pool_sandbox() {
+    local state_file="$(pool_dir "$1")/$2.state"
+    [[ -f "$state_file" ]]
+}
+
+# Kill a running watcher process for a pool sandbox
+# Usage: pool_kill_watcher <project> <session>
+pool_kill_watcher() {
+    local pid_file="$(pool_dir "$1")/$2.watcher-pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
+}
+
 validate_env_pair() {
     local pair="$1"
     # Must be KEY=VALUE format

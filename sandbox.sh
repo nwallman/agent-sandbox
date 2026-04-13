@@ -1363,47 +1363,14 @@ cmd_repair() {
     echo "Repaired .git pointer in $worktree_path"
 }
 
-cmd_merge() {
-    local project="$1"
-    local session="$2"
-    shift 2
+_do_merge() {
+    local project_path="$1"
+    local worktree_path="$2"
+    local branch_name="$3"
 
-    validate_session_name "$session"
-
-    local clean=false
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --clean) clean=true ;;
-        esac
-        shift
-    done
-
-    local worktree_path
-    worktree_path="$(resolve_worktree "$project" "$session")"
-    local project_path="$SANDBOX_BASE_DIR/$project"
-    local comp_name
-    comp_name=$(compose_project_name "$project" "$session")
-
-    if [[ ! -d "$worktree_path" ]]; then
-        echo "ERROR: No worktree found at $worktree_path" >&2
-        exit 1
-    fi
-
-    # Read the branch name
-    local branch_name="$session"
-    if [[ -f "${worktree_path}.sandbox-meta" ]]; then
-        branch_name=$(sed -n '1p' "${worktree_path}.sandbox-meta")
-    fi
-
-    # Stop the sandbox if running (restores .git pointer)
-    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
-        echo "Stopping sandbox first..."
-        cmd_stop "$project" "$session"
-        echo ""
-    fi
-
-    # Restore .git pointer if not already done
-    local worktree_name="${project}--${session}"
+    # Restore .git pointer
+    local worktree_name
+    worktree_name=$(basename "$worktree_path")
     local git_path="$project_path/.git/worktrees/$worktree_name"
     if [[ "$git_path" =~ ^/([a-zA-Z])/ ]]; then
         git_path="${BASH_REMATCH[1]^}:${git_path:2}"
@@ -1446,64 +1413,95 @@ cmd_merge() {
     find "$worktree_path" -maxdepth 2 -name 'package-lock.json' -newer "$worktree_path/.git" \
         -exec rm -f {} + 2>/dev/null || true
 
-    # Check for uncommitted changes in the worktree (the agent may not have committed)
+    # Validate: no uncommitted changes
     local uncommitted
     uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
     if [[ -n "$uncommitted" ]]; then
         echo "ERROR: Worktree has uncommitted changes:" >&2
-        echo "" >&2
         git -C "$worktree_path" status --short >&2
-        echo "" >&2
-        echo "The sandbox agent may not have finished committing." >&2
-        echo "Options:" >&2
-        echo "  sandbox shell $project $session   # Reconnect and commit manually" >&2
-        echo "  sandbox diff $project $session     # Review the uncommitted changes" >&2
-        exit 1
+        return 1
     fi
 
-    # Show what will be merged
+    # Validate: commits exist on the branch
     local current_branch
     current_branch=$(git -C "$project_path" rev-parse --abbrev-ref HEAD)
     local commit_count
     commit_count=$(git -C "$project_path" rev-list --count "${current_branch}..${branch_name}" 2>/dev/null || echo "0")
-
-    # Abort if there are no commits to merge
     if [[ "$commit_count" -eq 0 ]]; then
         echo "ERROR: No commits found on branch '$branch_name' beyond '$current_branch'." >&2
-        echo "" >&2
-        echo "The sandbox produced no committed changes. Nothing to merge." >&2
-        echo "Options:" >&2
-        echo "  sandbox shell $project $session   # Reconnect and check status" >&2
-        echo "  sandbox logs $project $session     # Review agent output" >&2
-        echo "  sandbox diff $project $session     # Check for uncommitted work" >&2
-        exit 1
+        return 1
     fi
 
     echo "Merging '$branch_name' into '$current_branch' ($commit_count commits)"
     echo ""
-
-    # Show diff summary
     git --no-pager -C "$project_path" diff --stat "${current_branch}...${branch_name}" 2>/dev/null
     echo ""
 
     # Perform the merge
-    if git -C "$project_path" merge "$branch_name" --no-edit; then
-        echo ""
-        echo "Merge complete. Branch '$branch_name' merged into '$current_branch'."
+    if ! git -C "$project_path" merge "$branch_name" --no-edit; then
+        echo "Merge failed (conflicts?). Resolve in: $project_path"
+        return 1
+    fi
 
-        if [[ "$clean" == "true" ]]; then
-            echo ""
-            echo "Cleaning up sandbox..."
-            cmd_stop "$project" "$session" --clean
-        else
-            echo ""
-            echo "Next steps:"
-            echo "  sandbox stop $project $session --clean   # Remove worktree, volumes, and branch"
-            echo "  git -C $project_path push                # Push to remote"
-        fi
+    echo "Merge complete. Branch '$branch_name' merged into '$current_branch'."
+    return 0
+}
+
+cmd_merge() {
+    local project="$1"
+    local session="$2"
+    shift 2
+
+    validate_session_name "$session"
+
+    local clean=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --clean) clean=true ;;
+        esac
+        shift
+    done
+
+    local worktree_path
+    worktree_path="$(resolve_worktree "$project" "$session")"
+    local project_path="$SANDBOX_BASE_DIR/$project"
+    local comp_name
+    comp_name=$(compose_project_name "$project" "$session")
+
+    if [[ ! -d "$worktree_path" ]]; then
+        echo "ERROR: No worktree found at $worktree_path" >&2
+        exit 1
+    fi
+
+    local branch_name="$session"
+    if [[ -f "${worktree_path}.sandbox-meta" ]]; then
+        branch_name=$(sed -n '1p' "${worktree_path}.sandbox-meta")
+    fi
+
+    # Stop the sandbox if running
+    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
+        echo "Stopping sandbox first..."
+        cmd_stop "$project" "$session"
+        echo ""
+    fi
+
+    # Run shared merge logic
+    if ! _do_merge "$project_path" "$worktree_path" "$branch_name"; then
+        echo ""
+        echo "Options:"
+        echo "  sandbox shell $project $session   # Reconnect"
+        echo "  sandbox diff $project $session     # Review changes"
+        exit 1
+    fi
+
+    if [[ "$clean" == "true" ]]; then
+        echo ""
+        echo "Cleaning up sandbox..."
+        cmd_stop "$project" "$session" --clean
     else
         echo ""
-        echo "Merge failed (conflicts?). Resolve in: $project_path"
+        echo "Next steps:"
+        echo "  sandbox stop $project $session --clean   # Remove worktree, volumes, and branch"
     fi
 }
 

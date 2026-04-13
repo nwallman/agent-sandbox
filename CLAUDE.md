@@ -6,12 +6,15 @@ Agent Sandbox is a provider-agnostic Docker sandbox for running AI coding agents
 
 | File | Purpose |
 |------|---------|
-| `sandbox.sh` | Main launcher (Bash). Commands: start, stop, list, logs, shell, headless, diff, repair |
+| `sandbox.sh` | Main launcher (Bash). Commands: start, stop, list, logs, shell, headless, diff, repair, pool (start/stop/status/assign/accept/reject/cancel/list) |
 | `sandbox.ps1` | PowerShell wrapper — delegates to `sandbox.sh` via Git Bash |
 | `docker-compose.base.yml` | Agent container template, parameterized via env vars |
 | `providers/` | Provider plugins — one subdirectory per agent type |
 | `images/` | Dockerfiles: `base/`, `proxy/`, `dind/`, `profiles/` |
 | `skills/` | Bundled Claude Code skills shipped into containers |
+| `<project>/.pool/` | Pool state directory (gitignored) — state files per pool sandbox |
+| `skills/sandbox-pool/` | Pool lifecycle management skill |
+| `skills/sandbox-accept/` | Review and merge pool sandbox work |
 | `.sandbox.env` | Local secrets/config (gitignored) |
 | `.sandbox.env.example` | Template for `.sandbox.env` |
 
@@ -24,6 +27,9 @@ Agent Sandbox is a provider-agnostic Docker sandbox for running AI coding agents
 - Volume names: `sandbox-<project>-<session>_<volume>`
 - Worktree dirs: `$SANDBOX_BASE_DIR/<project>/.worktrees/<project>--<session>`
 - Env var prefix: `SANDBOX_`
+- Pool session names: `pool-1`, `pool-2`, etc.
+- Pool state dir: `$SANDBOX_BASE_DIR/<project>/.pool/`
+- Pool state files: `<session>.state`, `<session>.plan`, `<session>.branch`, `<session>.provider`, `<session>.watcher-pid`
 
 ## Provider System
 

@@ -169,3 +169,13 @@ provider_headless() {
     echo ""
     docker exec -it "$container" claude $claude_args
 }
+
+# provider_process_name
+#
+# Returns the process name pattern used to detect when the agent is running.
+# Used by the pool completion watcher with pgrep -f.
+# The watcher applies the bracket trick automatically (claude -> [c]laude).
+#
+provider_process_name() {
+    echo "claude"
+}

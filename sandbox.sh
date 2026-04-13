@@ -140,6 +140,30 @@ Commands:
       Remove orphaned sandbox volumes from stopped sessions
       --force: skip confirmation prompt
 
+  pool start <project> [--count N] [--profile <name>] [--provider <name>] [--dangerous]
+      Start a persistent sandbox pool (N containers, default 1)
+
+  pool stop <project> [--force]
+      Stop all pool sandboxes and clean up
+
+  pool status <project>
+      Show pool sandbox states
+
+  pool assign <project> <plan-file> [--branch <name>]
+      Assign a plan to an idle pool sandbox (warm restart)
+
+  pool accept <project> <session>
+      Merge completed work and return sandbox to idle
+
+  pool reject <project> <session>
+      Discard work and return sandbox to idle
+
+  pool cancel <project> <session>
+      Kill running agent and move to reviewing state
+
+  pool list
+      Show all active pools across projects
+
   update
       Rebuild all sandbox images with latest agent CLI
 
@@ -1156,7 +1180,13 @@ cmd_list() {
                 sessions+=("$session")
                 local uptime
                 uptime=$(docker ps --filter "name=${container}-agent" --format '{{.Status}}' 2>/dev/null | head -1)
-                echo "  [$idx] $project / $session"
+                local pool_tag=""
+                if is_pool_sandbox "$project" "$session"; then
+                    local pool_state
+                    pool_state=$(pool_read_state "$project" "$session")
+                    pool_tag=" [pool:$pool_state]"
+                fi
+                echo "  [$idx] $project / $session${pool_tag}"
                 echo "      Status: $uptime"
                 echo ""
             else
@@ -2307,6 +2337,25 @@ case "$command" in
     merge)    cmd_merge "$@" ;;
     repair)   cmd_repair "$@" ;;
     prune)    cmd_prune "$@" ;;
+    pool)
+        local pool_cmd="${1:-}"
+        shift 2>/dev/null || true
+        case "$pool_cmd" in
+            start)  cmd_pool_start "$@" ;;
+            stop)   cmd_pool_stop "$@" ;;
+            status) cmd_pool_status "$@" ;;
+            assign) cmd_pool_assign "$@" ;;
+            accept) cmd_pool_accept "$@" ;;
+            reject) cmd_pool_reject "$@" ;;
+            cancel) cmd_pool_cancel "$@" ;;
+            list)   cmd_pool_list ;;
+            *)
+                echo "ERROR: Unknown pool command: $pool_cmd" >&2
+                echo "Available: start, stop, status, assign, accept, reject, cancel, list" >&2
+                exit 1
+                ;;
+        esac
+        ;;
     update)   cmd_update ;;
     -h|--help|help) usage ;;
     *)

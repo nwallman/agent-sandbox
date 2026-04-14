@@ -82,7 +82,20 @@ If pool status returns sandboxes (the `.pool/` directory exists for the project)
    
    **Stop here** unless the user chooses `--fresh`.
 
-If no pool exists or `--fresh` was passed, proceed to Step 5 (original cold-start behavior).
+If no pool exists and `--fresh` was NOT passed, **auto-create a pool of 1** for this project:
+
+```bash
+bash "$AGENT_SANDBOX_HOME/sandbox.sh" pool start <project> --count 1 --dangerous
+```
+
+Wait for the pool to be ready, then run `pool assign` as in case 1 above. Report:
+```
+No pool found — starting one (first time takes 2-5 min, future runs will be instant)...
+```
+
+This means the first `/sandbox-execute` for a project is a cold start (creating the pool), but every subsequent one reuses the warm sandbox.
+
+If `--fresh` was passed, proceed to Step 5 (original cold-start behavior).
 
 ### 5. Derive Session Name and Launch
 

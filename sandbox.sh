@@ -2398,7 +2398,7 @@ case "$command" in
     repair)   cmd_repair "$@" ;;
     prune)    cmd_prune "$@" ;;
     pool)
-        local pool_cmd="${1:-}"
+        pool_cmd="${1:-}"
         shift 2>/dev/null || true
         case "$pool_cmd" in
             start)  cmd_pool_start "$@" ;;

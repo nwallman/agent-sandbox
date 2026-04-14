@@ -1443,31 +1443,19 @@ _do_merge() {
     find "$worktree_path" -maxdepth 2 -name 'package-lock.json' -newer "$worktree_path/.git" \
         -exec rm -f {} + 2>/dev/null || true
 
-    # Remove common untracked test/build artifacts that aren't real code
-    git -C "$worktree_path" clean -fd \
-        -e '*.ts' -e '*.tsx' -e '*.js' -e '*.jsx' -e '*.json' -e '*.md' \
-        -e '*.java' -e '*.kt' -e '*.py' -e '*.go' -e '*.rs' \
-        -e '*.css' -e '*.html' -e '*.yaml' -e '*.yml' -e '*.toml' \
-        -e '*.xml' -e '*.gradle' -e '*.properties' -e '*.sql' \
-        -- '.nyc_output' 'coverage' 'test-results' '*.log' 2>/dev/null || true
-
-    # Fallback: if known artifact cleanup wasn't enough, stash remaining changes.
-    # This separates committed agent work from sandbox noise (seeded .env files,
-    # test output, runtime config changes). The stash is discarded — it's noise.
+    # Report any remaining uncommitted changes (don't fail — caller decides)
     local uncommitted
     uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
     if [[ -n "$uncommitted" ]]; then
-        echo "  Stashing sandbox noise ($(echo "$uncommitted" | wc -l | tr -d ' ') files)..."
-        git -C "$worktree_path" stash push -q --include-untracked -m "sandbox-artifacts" 2>/dev/null
-        # Verify stash worked
-        uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
-        if [[ -n "$uncommitted" ]]; then
-            echo "WARNING: Could not clean all uncommitted changes:" >&2
-            git -C "$worktree_path" status --short >&2
-            echo "Proceeding anyway — committed work will still merge." >&2
-        fi
-        # Drop the stash — it's just sandbox noise
-        git -C "$worktree_path" stash drop -q 2>/dev/null || true
+        local file_count
+        file_count=$(echo "$uncommitted" | wc -l | tr -d ' ')
+        echo ""
+        echo "  Uncommitted changes ($file_count files):"
+        git -C "$worktree_path" status --short 2>/dev/null | sed 's/^/    /'
+        echo ""
+        echo "  These were NOT included in the merge."
+        echo "  Worktree preserved at: $worktree_path"
+        echo ""
     fi
 
     # Validate: commits exist on the branch
@@ -1484,7 +1472,6 @@ _do_merge() {
             echo "Auto-committing agent work..." >&2
             git -C "$worktree_path" add -A
             git -C "$worktree_path" commit -m "feat: auto-commit uncommitted agent work" 2>/dev/null || true
-            # Re-check commit count
             commit_count=$(git -C "$project_path" rev-list --count "${current_branch}..${branch_name}" 2>/dev/null || echo "0")
         fi
         if [[ "$commit_count" -eq 0 ]]; then
@@ -2108,7 +2095,37 @@ cmd_pool_accept() {
         exit 1
     fi
 
-    # Clean up the worktree (but NOT volumes — pool keeps them)
+    # Check for uncommitted changes before cleanup — prompt user to confirm discard
+    local leftover
+    leftover=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
+    if [[ -n "$leftover" ]]; then
+        local file_count
+        file_count=$(echo "$leftover" | wc -l | tr -d ' ')
+        echo ""
+        echo "Uncommitted changes in worktree ($file_count files):"
+        git -C "$worktree_path" status --short 2>/dev/null | sed 's/^/  /'
+        echo ""
+        echo "These were NOT included in the merge."
+
+        local tty_in=/dev/stdin
+        [[ -t 0 ]] || { [[ -e /dev/tty ]] && tty_in=/dev/tty; }
+        local confirm
+        read -rp "Discard these changes and clean up? [y/N] " confirm < "$tty_in"
+        if [[ "$confirm" != [yY] ]]; then
+            echo ""
+            echo "Worktree preserved: $worktree_path"
+            echo "Commit anything you need, then run:"
+            echo "  sandbox pool accept $project $session"
+            pool_write_state "$project" "$session" "reviewing"
+            # Restart container so user can shell in if needed
+            local provider_name
+            provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
+            ( cmd_start "$project" "$session" --warm --branch "$branch_name" --provider "$provider_name" --dangerous )
+            return
+        fi
+    fi
+
+    # Clean up worktree and branch
     if [[ -d "$worktree_path" ]]; then
         git -C "$project_path" config core.longpaths true
         git -C "$project_path" worktree remove "$worktree_path" --force 2>/dev/null \

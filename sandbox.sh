@@ -2067,7 +2067,7 @@ cmd_pool_accept() {
     if mkdir "$lock_dir" 2>/dev/null; then
         local state
         state=$(cat "$state_file" 2>/dev/null)
-        if [[ "$state" == "reviewing" ]]; then
+        if [[ "$state" == "reviewing" || "$state" == "busy" ]]; then
             echo "accepting" > "$state_file"
             verified="yes"
         fi
@@ -2080,7 +2080,7 @@ cmd_pool_accept() {
     if [[ "$verified" != "yes" ]]; then
         local state
         state=$(pool_read_state "$project" "$session")
-        echo "ERROR: Pool sandbox '$session' is in state '$state', not 'reviewing'." >&2
+        echo "ERROR: Pool sandbox '$session' is in state '$state', expected 'busy' or 'reviewing'." >&2
         exit 1
     fi
 
@@ -2180,7 +2180,7 @@ cmd_pool_reject() {
     if mkdir "$lock_dir" 2>/dev/null; then
         local state
         state=$(cat "$state_file" 2>/dev/null)
-        if [[ "$state" == "reviewing" ]]; then
+        if [[ "$state" == "reviewing" || "$state" == "busy" ]]; then
             echo "rejecting" > "$state_file"
             verified="yes"
         fi

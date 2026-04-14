@@ -24,11 +24,13 @@ Run:
 bash "$AGENT_SANDBOX_HOME/sandbox.sh" pool status <project>
 ```
 
-Parse the output for sandboxes in `reviewing` state. If none found, tell the user: "No sandboxes are ready for review."
+Parse the output for sandboxes in `reviewing` or `busy` state. Both are eligible for accept — there is no background watcher that flips busy→reviewing, so the user decides when the agent is done.
+
+If none found in either state, tell the user: "No sandboxes are ready for review."
 
 ### 3. Select Sandbox
 
-If the user provided a session name as argument, use it. If multiple sandboxes are in `reviewing` state, list them and ask the user to choose:
+If the user provided a session name as argument, use it. If multiple sandboxes are eligible, list them and ask the user to choose:
 
 ```
 Sandboxes ready for review:

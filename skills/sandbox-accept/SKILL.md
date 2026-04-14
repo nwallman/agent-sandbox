@@ -42,14 +42,9 @@ Which one? [1/2]
 
 ### 4. Show Summary
 
-First, repair the .git pointer (the container rewrites it to internal paths, so host-side git won't work until this is fixed):
+First, repair the .git pointer (the container rewrites it to internal paths, so host-side git won't work until this is fixed). Do NOT stop the container — it stays warm for the next task:
 ```bash
 bash "$AGENT_SANDBOX_HOME/sandbox.sh" repair <project> <session>
-```
-
-Then stop the container if it's still running (needed so the .git pointer stays in host format):
-```bash
-bash "$AGENT_SANDBOX_HOME/sandbox.sh" stop <project> <session> 2>/dev/null || true
 ```
 
 Now show the diff:

@@ -2100,19 +2100,18 @@ cmd_pool_accept() {
     # Kill watcher if still running
     pool_kill_watcher "$project" "$session"
 
-    # Stop container to restore git pointer for host-side merge
-    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
-        cmd_stop "$project" "$session"
+    # Repair .git pointer so host-side git works (don't stop the container — keep it warm)
+    local worktree_name="${project}--${session}"
+    local git_pointer_path="$project_path/.git/worktrees/$worktree_name"
+    if [[ "$git_pointer_path" =~ ^/([a-zA-Z])/ ]]; then
+        git_pointer_path="${BASH_REMATCH[1]^}:${git_pointer_path:2}"
     fi
+    echo "gitdir: $git_pointer_path" > "$worktree_path/.git"
 
-    # Use shared merge logic
+    # Use shared merge logic (container stays running — merge works via bind mount)
     if ! _do_merge "$project_path" "$worktree_path" "$branch_name"; then
         echo ""
         echo "Reconnect with: sandbox shell $project $session"
-        # Restart container so user can fix
-        local provider_name
-        provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-        ( cmd_start "$project" "$session" --warm --branch "$branch_name" --provider "$provider_name" --dangerous )
         pool_write_state "$project" "$session" "reviewing"
         exit 1
     fi
@@ -2161,7 +2160,7 @@ cmd_pool_accept() {
     pool_write_state "$project" "$session" "idle"
 
     echo ""
-    echo "Pool sandbox '$session' is idle. Next pool assign will warm-restart it."
+    echo "Pool sandbox '$session' is idle and warm. Next plan will start instantly."
 }
 
 cmd_pool_reject() {
@@ -2213,10 +2212,13 @@ cmd_pool_reject() {
     # Kill watcher if still running
     pool_kill_watcher "$project" "$session"
 
-    # Stop container, restore git pointer
-    if docker compose -p "$comp_name" ps --status running 2>/dev/null | grep -q "agent"; then
-        cmd_stop "$project" "$session"
+    # Repair .git pointer so host-side git works (don't stop container — keep warm)
+    local worktree_name="${project}--${session}"
+    local git_pointer_path="$project_path/.git/worktrees/$worktree_name"
+    if [[ "$git_pointer_path" =~ ^/([a-zA-Z])/ ]]; then
+        git_pointer_path="${BASH_REMATCH[1]^}:${git_pointer_path:2}"
     fi
+    echo "gitdir: $git_pointer_path" > "$worktree_path/.git"
 
     # Remove worktree and branch
     if [[ -d "$worktree_path" ]]; then
@@ -2231,7 +2233,7 @@ cmd_pool_reject() {
     rm -f "$pdir/${session}.plan" "$pdir/${session}.branch"
     pool_write_state "$project" "$session" "idle"
 
-    echo "Pool sandbox '$session' is idle. Next pool assign will warm-restart it."
+    echo "Pool sandbox '$session' is idle and warm. Next plan will start instantly."
 }
 
 cmd_pool_cancel() {

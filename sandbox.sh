@@ -275,17 +275,27 @@ pool_read_state() {
     [[ -f "$state_file" ]] && cat "$state_file" || echo ""
 }
 
-# Write a pool sandbox state file with flock for concurrency safety
+# Write a pool sandbox state file with mkdir-based locking for concurrency safety
 # Usage: pool_write_state <project> <session> <state>
 pool_write_state() {
     local state_file="$(pool_dir "$1")/$2.state"
-    (
-        flock -x 200
-        echo "$3" > "$state_file"
-    ) 200>"${state_file}.lock"
+    local lock_dir="${state_file}.lock"
+    # mkdir-based lock: atomic on all platforms (flock not available in Git Bash)
+    local max_wait=10
+    local waited=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        sleep 0.1
+        waited=$((waited + 1))
+        if [[ $waited -ge $((max_wait * 10)) ]]; then
+            echo "WARNING: Could not acquire lock on $state_file after ${max_wait}s, proceeding" >&2
+            break
+        fi
+    done
+    echo "$3" > "$state_file"
+    rmdir "$lock_dir" 2>/dev/null || true
 }
 
-# Atomically find and claim the first idle pool sandbox by writing "busy" under flock.
+# Atomically find and claim the first idle pool sandbox by writing "busy" under mkdir lock.
 # Usage: pool_claim_idle <project>
 # Returns: session name (or empty if none idle)
 # Side effect: sets claimed sandbox state to "busy"
@@ -297,20 +307,18 @@ pool_claim_idle() {
         [[ -f "$state_file" ]] || continue
         local session
         session=$(basename "${state_file%.state}")
-        # Atomic read-and-claim under exclusive flock
-        local claimed
-        claimed=$(
-            flock -x 200
+        local lock_dir="${state_file}.lock"
+        # Atomic claim: mkdir lock, read state, write busy if idle, unlock
+        if mkdir "$lock_dir" 2>/dev/null; then
             local state
             state=$(cat "$state_file" 2>/dev/null)
             if [[ "$state" == "idle" ]]; then
                 echo "busy" > "$state_file"
+                rmdir "$lock_dir" 2>/dev/null || true
                 echo "$session"
+                return 0
             fi
-        ) 200>"${state_file}.lock"
-        if [[ -n "$claimed" ]]; then
-            echo "$claimed"
-            return 0
+            rmdir "$lock_dir" 2>/dev/null || true
         fi
     done
 }
@@ -1909,7 +1917,7 @@ cmd_pool_assign() {
     fi
     validate_branch_name "$branch"
 
-    # Atomically claim an idle sandbox (writes "busy" under flock)
+    # Atomically claim an idle sandbox (writes "busy" under mkdir lock)
     local session
     session=$(pool_claim_idle "$project")
 
@@ -1970,18 +1978,11 @@ cmd_pool_assign() {
     echo "$branch" > "$pdir/${session}.branch"
     # State is already "busy" from pool_claim_idle
 
-    echo ""
-    echo "Pool sandbox '$session' is now working on branch '$branch'."
+    echo "Pool sandbox '$session' container is ready on branch '$branch'."
+    echo "The sandbox-execute skill will launch the agent."
     echo ""
     echo "  Check status:  sandbox pool status $project"
-    echo "  View logs:     sandbox logs $project $session"
     echo "  Cancel:        sandbox pool cancel $project $session"
-
-    # Start background completion watcher with PID tracking
-    _pool_start_watcher "$project" "$session" "$comp_name" &
-    local watcher_pid=$!
-    echo "$watcher_pid" > "$pdir/${session}.watcher-pid"
-    disown "$watcher_pid"
 }
 
 _pool_start_watcher() {
@@ -2034,28 +2035,47 @@ _pool_start_watcher() {
 }
 
 cmd_pool_accept() {
-    local project="$1"
-    local session="$2"
+    local project=""
+    local session=""
+    local force=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            *)
+                if [[ -z "$project" ]]; then
+                    project="$1"
+                elif [[ -z "$session" ]]; then
+                    session="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if [[ -z "$project" || -z "$session" ]]; then
         echo "ERROR: pool accept requires <project> <session>" >&2
         exit 1
     fi
 
-    # Atomic state check under flock
+    # Atomic state check with mkdir lock
     local pdir
     pdir="$(pool_dir "$project")"
     local state_file="$pdir/${session}.state"
-    local verified
-    verified=$(
-        flock -x 200
+    local lock_dir="${state_file}.lock"
+    local verified="no"
+    if mkdir "$lock_dir" 2>/dev/null; then
         local state
         state=$(cat "$state_file" 2>/dev/null)
         if [[ "$state" == "reviewing" ]]; then
             echo "accepting" > "$state_file"
-            echo "yes"
+            verified="yes"
         fi
-    ) 200>"${state_file}.lock"
+        rmdir "$lock_dir" 2>/dev/null || true
+    else
+        echo "ERROR: Could not acquire lock on pool sandbox '$session'." >&2
+        exit 1
+    fi
 
     if [[ "$verified" != "yes" ]]; then
         local state
@@ -2107,21 +2127,21 @@ cmd_pool_accept() {
         echo ""
         echo "These were NOT included in the merge."
 
-        local tty_in=/dev/stdin
-        [[ -t 0 ]] || { [[ -e /dev/tty ]] && tty_in=/dev/tty; }
-        local confirm
-        read -rp "Discard these changes and clean up? [y/N] " confirm < "$tty_in"
-        if [[ "$confirm" != [yY] ]]; then
-            echo ""
-            echo "Worktree preserved: $worktree_path"
-            echo "Commit anything you need, then run:"
-            echo "  sandbox pool accept $project $session"
-            pool_write_state "$project" "$session" "reviewing"
-            # Restart container so user can shell in if needed
-            local provider_name
-            provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-            ( cmd_start "$project" "$session" --warm --branch "$branch_name" --provider "$provider_name" --dangerous )
-            return
+        if [[ "$force" == "true" ]]; then
+            echo "  --force: discarding uncommitted changes."
+        else
+            local tty_in=/dev/stdin
+            [[ -t 0 ]] || { [[ -e /dev/tty ]] && tty_in=/dev/tty; }
+            local confirm
+            read -rp "Discard these changes and clean up? [y/N] " confirm < "$tty_in"
+            if [[ "$confirm" != [yY] ]]; then
+                echo ""
+                echo "Worktree preserved: $worktree_path"
+                echo "Commit anything you need, then run:"
+                echo "  sandbox pool accept $project $session"
+                pool_write_state "$project" "$session" "reviewing"
+                return
+            fi
         fi
     fi
 
@@ -2138,15 +2158,8 @@ cmd_pool_accept() {
     rm -f "$pdir/${session}.plan" "$pdir/${session}.branch"
     pool_write_state "$project" "$session" "idle"
 
-    # Restart the container so it's warm for next task
     echo ""
-    echo "Restarting pool sandbox '$session' for next task..."
-    local provider_name
-    provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-    ( cmd_start "$project" "$session" --warm --provider "$provider_name" --dangerous )
-
-    echo ""
-    echo "Pool sandbox '$session' is idle and ready for next task."
+    echo "Pool sandbox '$session' is idle. Next pool assign will warm-restart it."
 }
 
 cmd_pool_reject() {
@@ -2158,20 +2171,24 @@ cmd_pool_reject() {
         exit 1
     fi
 
-    # Atomic state check under flock
+    # Atomic state check with mkdir lock
     local pdir
     pdir="$(pool_dir "$project")"
     local state_file="$pdir/${session}.state"
-    local verified
-    verified=$(
-        flock -x 200
+    local lock_dir="${state_file}.lock"
+    local verified="no"
+    if mkdir "$lock_dir" 2>/dev/null; then
         local state
         state=$(cat "$state_file" 2>/dev/null)
         if [[ "$state" == "reviewing" ]]; then
             echo "rejecting" > "$state_file"
-            echo "yes"
+            verified="yes"
         fi
-    ) 200>"${state_file}.lock"
+        rmdir "$lock_dir" 2>/dev/null || true
+    else
+        echo "ERROR: Could not acquire lock on pool sandbox '$session'." >&2
+        exit 1
+    fi
 
     if [[ "$verified" != "yes" ]]; then
         local state
@@ -2212,13 +2229,7 @@ cmd_pool_reject() {
     rm -f "$pdir/${session}.plan" "$pdir/${session}.branch"
     pool_write_state "$project" "$session" "idle"
 
-    # Restart the container
-    echo "Restarting pool sandbox '$session'..."
-    local provider_name
-    provider_name=$(cat "$pdir/${session}.provider" 2>/dev/null || echo "$SANDBOX_PROVIDER")
-    ( cmd_start "$project" "$session" --warm --provider "$provider_name" --dangerous )
-
-    echo "Pool sandbox '$session' is idle and ready for next task."
+    echo "Pool sandbox '$session' is idle. Next pool assign will warm-restart it."
 }
 
 cmd_pool_cancel() {

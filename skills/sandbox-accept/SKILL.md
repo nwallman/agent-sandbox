@@ -64,7 +64,7 @@ What do you want to do?
 
 **Accept:**
 ```bash
-bash "$AGENT_SANDBOX_HOME/sandbox.sh" pool accept <project> <session>
+bash "$AGENT_SANDBOX_HOME/sandbox.sh" pool accept <project> <session> --force
 ```
 
 Report:

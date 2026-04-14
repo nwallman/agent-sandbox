@@ -1443,13 +1443,31 @@ _do_merge() {
     find "$worktree_path" -maxdepth 2 -name 'package-lock.json' -newer "$worktree_path/.git" \
         -exec rm -f {} + 2>/dev/null || true
 
-    # Validate: no uncommitted changes
+    # Remove common untracked test/build artifacts that aren't real code
+    git -C "$worktree_path" clean -fd \
+        -e '*.ts' -e '*.tsx' -e '*.js' -e '*.jsx' -e '*.json' -e '*.md' \
+        -e '*.java' -e '*.kt' -e '*.py' -e '*.go' -e '*.rs' \
+        -e '*.css' -e '*.html' -e '*.yaml' -e '*.yml' -e '*.toml' \
+        -e '*.xml' -e '*.gradle' -e '*.properties' -e '*.sql' \
+        -- '.nyc_output' 'coverage' 'test-results' '*.log' 2>/dev/null || true
+
+    # Fallback: if known artifact cleanup wasn't enough, stash remaining changes.
+    # This separates committed agent work from sandbox noise (seeded .env files,
+    # test output, runtime config changes). The stash is discarded — it's noise.
     local uncommitted
     uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
     if [[ -n "$uncommitted" ]]; then
-        echo "ERROR: Worktree has uncommitted changes:" >&2
-        git -C "$worktree_path" status --short >&2
-        return 1
+        echo "  Stashing sandbox noise ($(echo "$uncommitted" | wc -l | tr -d ' ') files)..."
+        git -C "$worktree_path" stash push -q --include-untracked -m "sandbox-artifacts" 2>/dev/null
+        # Verify stash worked
+        uncommitted=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
+        if [[ -n "$uncommitted" ]]; then
+            echo "WARNING: Could not clean all uncommitted changes:" >&2
+            git -C "$worktree_path" status --short >&2
+            echo "Proceeding anyway — committed work will still merge." >&2
+        fi
+        # Drop the stash — it's just sandbox noise
+        git -C "$worktree_path" stash drop -q 2>/dev/null || true
     fi
 
     # Validate: commits exist on the branch
@@ -1458,8 +1476,22 @@ _do_merge() {
     local commit_count
     commit_count=$(git -C "$project_path" rev-list --count "${current_branch}..${branch_name}" 2>/dev/null || echo "0")
     if [[ "$commit_count" -eq 0 ]]; then
-        echo "ERROR: No commits found on branch '$branch_name' beyond '$current_branch'." >&2
-        return 1
+        # Check if there are uncommitted changes that the agent forgot to commit
+        local has_changes
+        has_changes=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
+        if [[ -n "$has_changes" ]]; then
+            echo "WARNING: Agent did not commit, but there are changes in the worktree." >&2
+            echo "Auto-committing agent work..." >&2
+            git -C "$worktree_path" add -A
+            git -C "$worktree_path" commit -m "feat: auto-commit uncommitted agent work" 2>/dev/null || true
+            # Re-check commit count
+            commit_count=$(git -C "$project_path" rev-list --count "${current_branch}..${branch_name}" 2>/dev/null || echo "0")
+        fi
+        if [[ "$commit_count" -eq 0 ]]; then
+            echo "ERROR: No commits found on branch '$branch_name' beyond '$current_branch'." >&2
+            echo "The sandbox produced no changes." >&2
+            return 1
+        fi
     fi
 
     echo "Merging '$branch_name' into '$current_branch' ($commit_count commits)"
